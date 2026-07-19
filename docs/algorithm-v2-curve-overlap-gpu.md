@@ -1,6 +1,6 @@
 # 算法修订：曲线色块 + 超界重叠 + 线条质量 + GPU
 
-> 状态：设计修订 v0.2（取代纯像素 Matching Pursuit 作为主路径）  
+> 状态：**已落地 v0.2 主路径**（`approx/blocks|curves|stamp_curves|match_curve|torch_render|line_quality|metrics|pipeline`）  
 > 背景：v0.1 实现观感不理想、CPU 测试可达数分钟；需利用「图章可大幅放大并伸出画布、靠重叠造型」的真实编辑器能力。
 
 ---
@@ -351,3 +351,4 @@ CLI 保持 `bfemblem approx` / `score`；`score` 必须输出分项：`sim/line/
 | 版本 | 日期 | 说明 |
 |------|------|------|
 | 0.2 | 2026-07-19 | 曲线色块主路径、重叠/出画布、线条硬门槛、GPU 性能目标 |
+| 0.2.1 | 2026-07-19 | 代码落地：torch cu128、粒子匹配、综合评分、CLI/测试门禁 |

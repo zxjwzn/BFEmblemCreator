@@ -17,6 +17,7 @@ from bf_emblem_creator.approx.models import (
     ApproxTarget,
     LayerHint,
     PaletteColor,
+    ResampleMode,
 )
 
 U8Arr = NDArray[np.uint8]
@@ -58,22 +59,140 @@ def detect_mode(rgba: Image.Image) -> AbstractionMode:
     return AbstractionMode.illustration
 
 
+def estimate_color_stats(rgba: Image.Image | U8Arr) -> dict[str, float]:
+    """
+    主体颜色/边缘统计，供自适应重采样（Batch A）。
+
+    返回 approx_color_count、peak_ratio、soft_alpha_frac、grad_frac 等。
+    """
+    arr = np.asarray(rgba, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[-1] < 3:
+        return {
+            "approx_color_count": 0.0,
+            "peak_ratio": 1.0,
+            "soft_alpha_frac": 0.0,
+            "grad_frac": 0.0,
+            "subject_frac": 0.0,
+        }
+    if arr.shape[-1] >= 4:
+        a = arr[:, :, 3].astype(np.float64) / 255.0
+        subject = a >= 0.5
+        soft_alpha_frac = float(((a > 0.05) & (a < 0.95)).mean())
+    else:
+        subject = np.ones(arr.shape[:2], dtype=bool)
+        soft_alpha_frac = 0.0
+    if not subject.any():
+        return {
+            "approx_color_count": 0.0,
+            "peak_ratio": 1.0,
+            "soft_alpha_frac": soft_alpha_frac,
+            "grad_frac": 0.0,
+            "subject_frac": 0.0,
+        }
+    rgb = arr[:, :, :3]
+    # 5-bit 量化估计独特色数（抗极少噪声）
+    q = (rgb[subject] // 32).astype(np.int32)
+    keys = q[:, 0].astype(np.int64) * 1024 + q[:, 1].astype(np.int64) * 32 + q[:, 2].astype(np.int64)
+    uniq, counts = np.unique(keys, return_counts=True)
+    order = np.argsort(-counts)
+    c0 = float(counts[order[0]]) if len(counts) else 1.0
+    c1 = float(counts[order[1]]) if len(counts) > 1 else c0
+    peak_ratio = c0 / max(c1, 1.0)
+    gray = rgb.astype(np.float64).mean(axis=2)
+    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    g = np.maximum(gx, gy)
+    g_sub = g[subject]
+    thr = float(np.percentile(g_sub, 70)) if g_sub.size else 0.0
+    grad_frac = float((g_sub >= max(thr, 4.0)).mean()) if g_sub.size else 0.0
+    return {
+        "approx_color_count": float(len(uniq)),
+        "peak_ratio": float(peak_ratio),
+        "soft_alpha_frac": soft_alpha_frac,
+        "grad_frac": grad_frac,
+        "subject_frac": float(subject.mean()),
+    }
+
+
+def detect_resample_mode(
+    rgba: Image.Image | U8Arr,
+    *,
+    target_size: int = 320,
+    configured: ResampleMode | str = ResampleMode.auto,
+) -> tuple[str, dict[str, float]]:
+    """
+    通用重采样决策：色数少/尖峰强 → nearest；否则 lanczos。
+
+    禁止场景文件名特判；阈值可测。
+    """
+    stats = estimate_color_stats(rgba)
+    conf = configured.value if isinstance(configured, ResampleMode) else str(configured)
+    if conf in {"nearest", "lanczos", "bilinear"}:
+        return conf, stats
+    n_col = float(stats["approx_color_count"])
+    peak = float(stats["peak_ratio"])
+    # 平面色 / 像素风
+    if n_col <= 24.0 and peak >= 1.15:
+        return "nearest", stats
+    if n_col <= 48.0 and peak >= 1.8:
+        return "nearest", stats
+    # 源已接近目标边长且色少：仍优先硬边
+    if isinstance(rgba, Image.Image):
+        sw, sh = rgba.size
+    else:
+        sh, sw = np.asarray(rgba).shape[:2]
+    if max(sw, sh) <= target_size and n_col <= 32.0:
+        return "nearest", stats
+    return "lanczos", stats
+
+
+def _pil_resample(name: str) -> Image.Resampling:
+    if name == "nearest":
+        return Image.Resampling.NEAREST
+    if name == "bilinear":
+        return Image.Resampling.BILINEAR
+    return Image.Resampling.LANCZOS
+
+
 def fit_to_canvas(
     rgba: Image.Image,
     size: int,
     *,
     how: str,
+    resample: str | ResampleMode = "lanczos",
+    color_stats: dict[str, float] | None = None,
 ) -> tuple[U8Arr, ApproxMeta]:
     """将图像 fit 到 size×size，返回 RGBA uint8 与元数据。"""
     src_w, src_h = rgba.size
     if how not in {"contain", "cover"}:
         raise ValueError("how 必须是 contain 或 cover")
 
+    rname = resample.value if isinstance(resample, ResampleMode) else str(resample)
+    if rname == "auto":
+        rname, stats = detect_resample_mode(rgba, target_size=size)
+    else:
+        stats = color_stats if color_stats is not None else estimate_color_stats(rgba)
+
     scale = min(size / src_w, size / src_h) if how == "contain" else max(size / src_w, size / src_h)
 
     new_w = max(1, round(src_w * scale))
     new_h = max(1, round(src_h * scale))
-    resized = rgba.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    # 平面色：优先整数倍最近邻，减少相位误差
+    if rname == "nearest" and how == "contain":
+        ix = max(1, round(size / src_w))
+        iy = max(1, round(size / src_h))
+        im = min(ix, iy)
+        if (
+            im >= 1
+            and im * src_w <= size
+            and im * src_h <= size
+            and im * min(src_w, src_h) >= round(scale * min(src_w, src_h)) * 0.85
+        ):
+            # 仅当整数倍不小于非整数缩放（或接近）时采用
+            new_w, new_h = im * src_w, im * src_h
+            scale = float(im)
+
+    resized = rgba.resize((new_w, new_h), _pil_resample(rname))
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     ox = (size - new_w) // 2
     oy = (size - new_h) // 2
@@ -87,6 +206,8 @@ def fit_to_canvas(
         scale=scale,
         offset_x=float(ox),
         offset_y=float(oy),
+        resample=rname,
+        approx_color_count=int(stats.get("approx_color_count", 0)),
     )
     return np.asarray(canvas, dtype=np.uint8), meta
 
@@ -95,11 +216,7 @@ def estimate_alpha(rgba: U8Arr, mode: AbstractionMode) -> FloatArr:
     """估计主体蒙版。"""
     a = rgba[:, :, 3].astype(np.float64) / 255.0
     # 已有有效 alpha（如 emoji）则直接用，否则角点洪水估背景
-    alpha = (
-        a
-        if float(a.max()) > 0.05 and float(a.mean()) < 0.98
-        else _flood_background_alpha(rgba[:, :, :3])
-    )
+    alpha = a if float(a.max()) > 0.05 and float(a.mean()) < 0.98 else _flood_background_alpha(rgba[:, :, :3])
 
     alpha = _morph_cleanup_alpha(alpha)
     # 保留最大连通域（避免碎屑）
@@ -253,9 +370,7 @@ def quantize_lab(
 
     for frac, _, rgb_c in order:
         r, g, b = int(rgb_c[0]), int(rgb_c[1]), int(rgb_c[2])
-        palette.append(
-            PaletteColor(hex=rgb_to_hex((r, g, b)), fraction=frac, rgb=(r, g, b))
-        )
+        palette.append(PaletteColor(hex=rgb_to_hex((r, g, b)), fraction=frac, rgb=(r, g, b)))
     return labels, palette
 
 
@@ -287,9 +402,7 @@ def merge_tiny_and_close(
     """合并过小色与 LAB 过近色。"""
     if not palette:
         return labels, palette
-    labs = rgb_u8_to_lab(
-        np.array([p.rgb for p in palette], dtype=np.uint8).reshape(-1, 1, 3)
-    )[:, 0, :]
+    labs = rgb_u8_to_lab(np.array([p.rgb for p in palette], dtype=np.uint8).reshape(-1, 1, 3))[:, 0, :]
 
     # 近色合并
     parent = list(range(len(palette)))
@@ -338,9 +451,7 @@ def merge_tiny_and_close(
         members = [i for i in range(len(palette)) if find(i) == r]
         members.sort(key=lambda i: -palette[i].fraction)
         rgb = palette[members[0]].rgb
-        new_palette.append(
-            PaletteColor(hex=rgb_to_hex(rgb), fraction=frac, rgb=rgb)
-        )
+        new_palette.append(PaletteColor(hex=rgb_to_hex(rgb), fraction=frac, rgb=rgb))
     # 再按面积排序
     order = sorted(range(len(new_palette)), key=lambda i: -new_palette[i].fraction)
     remap = {old: new for new, old in enumerate(order)}
@@ -429,9 +540,7 @@ def _neighbor_majority(labels: I32Arr, region: NDArray[np.bool_], forbid: int) -
     return counts.most_common(1)[0][0]
 
 
-def _neighbor_majority_batch(
-    labels: I32Arr, region: NDArray[np.bool_], forbid: int
-) -> I32Arr:
+def _neighbor_majority_batch(labels: I32Arr, region: NDArray[np.bool_], forbid: int) -> I32Arr:
     """为 region 内每个像素找邻域众数（简化：整体一个众数）。"""
     maj = _neighbor_majority(labels, region, forbid)
     return np.full(int(region.sum()), maj, dtype=np.int32)
@@ -442,22 +551,8 @@ def build_weight(alpha: FloatArr, image_q: U8Arr, mode: AbstractionMode) -> Floa
     gray = image_q.astype(np.float64).mean(axis=2) / 255.0
     # sobel
     g = np.pad(gray, 1, mode="edge")
-    gx = (
-        -g[:-2, :-2]
-        + g[:-2, 2:]
-        - 2 * g[1:-1, :-2]
-        + 2 * g[1:-1, 2:]
-        - g[2:, :-2]
-        + g[2:, 2:]
-    )
-    gy = (
-        -g[:-2, :-2]
-        - 2 * g[:-2, 1:-1]
-        - g[:-2, 2:]
-        + g[2:, :-2]
-        + 2 * g[2:, 1:-1]
-        + g[2:, 2:]
-    )
+    gx = -g[:-2, :-2] + g[:-2, 2:] - 2 * g[1:-1, :-2] + 2 * g[1:-1, 2:] - g[2:, :-2] + g[2:, 2:]
+    gy = -g[:-2, :-2] - 2 * g[:-2, 1:-1] - g[:-2, 2:] + g[2:, :-2] + 2 * g[2:, 1:-1] + g[2:, 2:]
     edge = np.hypot(gx, gy)
     if edge.max() > 1e-8:
         edge = edge / edge.max()
@@ -544,12 +639,17 @@ def abstract_image(
     mode = detect_mode(rgba_img) if cfg.mode == AbstractionMode.auto else cfg.mode
     fit = "cover" if mode.value.startswith("photo") else "contain"
 
-    rgba, meta = fit_to_canvas(rgba_img, cfg.canvas_size, how=fit)
+    r_mode, _stats = detect_resample_mode(rgba_img, target_size=cfg.canvas_size, configured=cfg.resample_mode)
+    rgba, meta = fit_to_canvas(rgba_img, cfg.canvas_size, how=fit, resample=r_mode)
     meta = meta.model_copy(update={"mode": mode})
     alpha = estimate_alpha(rgba, mode)
     rgb = rgba[:, :, :3]
 
-    if cfg.bilateral and mode != AbstractionMode.logo:
+    # nearest 硬边内容：关闭滤波，避免再糊
+    hard_edge = meta.resample == "nearest" and meta.approx_color_count <= 48
+    if hard_edge:
+        pass
+    elif cfg.bilateral and mode != AbstractionMode.logo:
         strength = "strong" if mode.value.startswith("photo") else "medium"
         rgb = bilateral_smooth(rgb, strength=strength)
     elif mode == AbstractionMode.logo:

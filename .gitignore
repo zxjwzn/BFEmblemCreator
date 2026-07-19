@@ -9,8 +9,9 @@ __pycache__/
 dist/
 build/
 
-# Outputs
+# Outputs / caches
 out/
+assets/.cache/
 
 # IDE / OS
 .idea/

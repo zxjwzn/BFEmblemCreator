@@ -20,7 +20,6 @@ def renderer() -> EmblemRenderer:
     return EmblemRenderer(RenderConfig(stamps_dir=STAMPS, supersample=4.0))
 
 
-
 def test_load_editor_export_with_selectable() -> None:
     doc = EmblemDocument.load_json(SAMPLE)
     assert len(doc) >= 1
@@ -91,12 +90,8 @@ def test_supersample_softens_diagonal_edges() -> None:
         ]
     )
     canvas = CanvasConfig(width=320, height=320, background="#000000")
-    low = EmblemRenderer(
-        RenderConfig(stamps_dir=STAMPS, canvas=canvas, supersample=1.0)
-    ).render(doc)
-    high = EmblemRenderer(
-        RenderConfig(stamps_dir=STAMPS, canvas=canvas, supersample=4.0)
-    ).render(doc)
+    low = EmblemRenderer(RenderConfig(stamps_dir=STAMPS, canvas=canvas, supersample=1.0)).render(doc)
+    high = EmblemRenderer(RenderConfig(stamps_dir=STAMPS, canvas=canvas, supersample=4.0)).render(doc)
     low_g = _max_luma_gradient(low)
     high_g = _max_luma_gradient(high)
     assert high_g < low_g

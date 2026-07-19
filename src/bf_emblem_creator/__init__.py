@@ -2,13 +2,13 @@
 
 from bf_emblem_creator.approx import (
     ApproxConfig,
-    ApproxResult,
-    ApproxTarget,
-    SimilarityReport,
-    abstract_image,
+    ApproxResultV2,
+    BlockTarget,
+    FullScoreReport,
+    abstract_to_blocks,
     approximate_image,
-    compare_images,
-    score_fit,
+    evaluate_line_quality,
+    score_prediction,
 )
 from bf_emblem_creator.models import (
     CanvasConfig,
@@ -21,19 +21,19 @@ from bf_emblem_creator.render import EmblemRenderer
 
 __all__ = [
     "ApproxConfig",
-    "ApproxResult",
-    "ApproxTarget",
+    "ApproxResultV2",
+    "BlockTarget",
     "CanvasConfig",
     "EmblemDocument",
     "EmblemRenderer",
+    "FullScoreReport",
     "HexColor",
     "RenderConfig",
-    "SimilarityReport",
     "StampLayer",
-    "abstract_image",
+    "abstract_to_blocks",
     "approximate_image",
-    "compare_images",
-    "score_fit",
+    "evaluate_line_quality",
+    "score_prediction",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

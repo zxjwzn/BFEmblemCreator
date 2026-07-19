@@ -175,12 +175,7 @@ class EmblemRenderer:
 
         src_h, src_w = pre.shape[:2]
         # 面积平均（整数倍时为标准盒滤 SSAA；非整数倍时用分箱近似）
-        if (
-            src_w % width == 0
-            and src_h % height == 0
-            and src_w >= width
-            and src_h >= height
-        ):
+        if src_w % width == 0 and src_h % height == 0 and src_w >= width and src_h >= height:
             factor_x = src_w // width
             factor_y = src_h // height
             reshaped = pre.reshape(height, factor_y, width, factor_x, 4)
