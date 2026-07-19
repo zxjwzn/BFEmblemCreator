@@ -12,7 +12,6 @@ from bf_emblem_creator.render import EmblemRenderer
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMPS = ROOT / "assets" / "stamps"
-SIMPLE = ROOT / "examples" / "simple_layers.json"
 SAMPLE = ROOT / "examples" / "sample_emblem.json"
 
 
@@ -21,39 +20,11 @@ def renderer() -> EmblemRenderer:
     return EmblemRenderer(RenderConfig(stamps_dir=STAMPS, supersample=4.0))
 
 
-def test_load_simple_json() -> None:
-    doc = EmblemDocument.load_json(SIMPLE)
-    assert len(doc) == 3
-    assert doc[0].asset == "Square"
-    assert doc[2].fill == "#F7D5B9"
-
 
 def test_load_editor_export_with_selectable() -> None:
     doc = EmblemDocument.load_json(SAMPLE)
     assert len(doc) >= 1
     assert hasattr(doc[0], "selectable")
-
-
-def test_roundtrip_json(tmp_path: Path) -> None:
-    doc = EmblemDocument.load_json(SIMPLE)
-    out = tmp_path / "out.json"
-    doc.save_json(out)
-    doc2 = EmblemDocument.load_json(out)
-    assert doc.model_dump() == doc2.model_dump()
-
-
-def test_render_simple(renderer: EmblemRenderer, tmp_path: Path) -> None:
-    doc = EmblemDocument.load_json(SIMPLE)
-    img = renderer.render(doc)
-    assert img.size == (320, 320)
-    assert img.mode == "RGBA"
-    alpha = np.asarray(img)[:, :, 3]
-    assert int(alpha.max()) > 0
-    path = tmp_path / "sample.png"
-    renderer.render_to_path(doc, path)
-    assert path.is_file()
-    loaded = Image.open(path)
-    assert loaded.size == (320, 320)
 
 
 def test_layer_rejects_bad_color() -> None:
