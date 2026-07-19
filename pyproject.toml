@@ -1,0 +1,104 @@
+[project]
+name = "bf-emblem-creator"
+version = "0.1.0"
+description = "战地图章徽章离线渲染器（后续扩展自动摆放）"
+readme = "README.md"
+authors = [
+    { name = "Zaxpris", email = "zaxpris@qq.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "pillow>=10.0",
+    "pydantic>=2.0",
+    "pymupdf>=1.24",
+    "typer>=0.12",
+]
+
+[project.scripts]
+bfemblem = "bf_emblem_creator.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+    "pyright>=1.1",
+]
+
+[tool.ruff]
+extend-exclude = []
+line-length = 128
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+ignore = [
+    "E402",
+    "E501",
+    "E722",
+    "COM812",
+    "ISC001",
+    "B008",
+    "B905",
+    "TID252",
+    "TRY002",
+    "TRY003",
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    "RUF006",
+    "RUF012",
+    "RUF100",
+    "PGH003",
+    "N801",
+    "A003",
+]
+select = [
+    "F",
+    "E",
+    "I",
+    "B",
+    "A",
+    "COM",
+    "C4",
+    "ISC",
+    "PIE",
+    "PYI",
+    "Q",
+    "RSE",
+    "RET",
+    "SLF",
+    "SIM",
+    "TID",
+    "ARG",
+    "PTH",
+    "PGH",
+    "TRY",
+    "RUF",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bf_emblem_creator"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.pyright]
+include = ["src", "tests"]
+exclude = [".venv", "out", "**/__pycache__"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+reportMissingImports = true
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
