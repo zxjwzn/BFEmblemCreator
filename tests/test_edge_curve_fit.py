@@ -163,3 +163,58 @@ def test_simplify_planar_map_reduces_vertices() -> None:
     assert rep.edges_total >= 1
     assert n_after < n_before
     assert rep.edges_fitted >= 1 or rep.edges_skipped >= 1
+
+
+def test_region_contour_uses_fitted_shared_edges() -> None:
+    """curve_fit 后 Region.contour / 匹配点云必须与 SharedEdge.polyline 同源。"""
+    from bf_emblem_creator.approx.planar_map import (
+        assert_planar_map_valid,
+        face_contour,
+        face_shape_boundary_points,
+        planar_map_to_region_graph,
+    )
+
+    size = 64
+    rgb = np.zeros((size, size, 3), dtype=np.uint8)
+    # 圆台阶边界，促使贝塞尔拟合产生宏观弦
+    yy, xx = np.ogrid[:size, :size]
+    disk = (xx - size / 2) ** 2 + (yy - size / 2) ** 2 <= (size * 0.32) ** 2
+    rgb[...] = (40, 40, 200)
+    rgb[disk] = (220, 40, 40)
+    alpha = np.ones((size, size), dtype=np.float64)
+    labels, palette, gf, _ = build_label_field(rgb, alpha, num_colors=2, mrf_iters=2, enforce_no_gap=True, seed=0)
+    pmap = build_planar_map(labels, palette, alpha, gap_frac=gf)
+    assert_planar_map_valid(pmap)
+    simplify_planar_map_curves(pmap)
+    assert_planar_map_valid(pmap)
+
+    # 收集拟合后边上所有点
+    edge_pts = []
+    for e in pmap.edges:
+        poly = np.asarray(e.polyline, dtype=np.float64)
+        if len(poly) >= 2:
+            edge_pts.append(poly)
+    assert edge_pts, "平面图应有共享边"
+    all_edge = np.vstack(edge_pts)
+
+    graph = planar_map_to_region_graph(pmap)
+    assert graph.regions
+    for reg in graph.regions:
+        cont = np.asarray(reg.contour, dtype=np.float64)
+        assert len(cont) >= 3
+        # 轮廓上每个点都应贴近某条 SharedEdge（同源，而非独立 Moore 阶梯）
+        body = cont[:-1] if len(cont) > 1 and np.allclose(cont[0], cont[-1]) else cont
+        # 抽样检查，避免 O(n*m) 过重
+        sample = body[:: max(1, len(body) // 24)]
+        dmin = np.linalg.norm(sample[:, None, :] - all_edge[None, :, :], axis=2).min(axis=1)
+        assert float(np.median(dmin)) < 1.5, f"region {reg.region_id} 轮廓偏离共享边 med={float(np.median(dmin)):.3f}"
+
+        # face_shape_boundary_points 亦同源
+        pts = face_shape_boundary_points(pmap, reg.region_id, only_shape=True)
+        assert len(pts) >= 4
+        d2 = np.linalg.norm(pts[:, None, :] - all_edge[None, :, :], axis=2).min(axis=1)
+        assert float(np.median(d2)) < 1.5
+
+        # face_contour 与 Region.contour 点数同量级（均来自边环）
+        fc = face_contour(pmap, reg.region_id)
+        assert abs(len(fc) - len(cont)) <= max(4, len(cont) // 5)

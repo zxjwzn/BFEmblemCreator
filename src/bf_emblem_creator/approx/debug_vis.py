@@ -196,7 +196,7 @@ class DebugVisualizer:
         self.save_rgb("01_labels_falsecolor", vis)
 
     def save_regions(self, base_rgb: NDArray[np.generic] | U8Arr, regions: Iterable[Region]) -> None:
-        """区域蒙版叠加 + 外轮廓（用密重采样轮廓绘制，避免稀疏 RDP 折线）。"""
+        """区域蒙版叠加 + 外轮廓（与 SharedEdge / after_fit 同源的 Region.contour）。"""
         base = _as_rgb_u8(base_rgb)
         overlay = base.copy()
         items = list(regions)
@@ -208,14 +208,14 @@ class DebugVisualizer:
         draw2 = ImageDraw.Draw(img2)
         for i, reg in enumerate(items):
             color = _PALETTE[i % len(_PALETTE)]
-            # 调试：优先较疏采样，避免满屏密折线
+            # 完整共享边轮廓（curve_fit 后即贝塞尔环）；过密时等弧抽稀仅影响显示
             raw = reg.contour if reg.contour is not None else reg.contour_resampled
             pts = None
             if raw is not None:
                 arr = np.asarray(raw, dtype=np.float64)
                 if len(arr) >= 2:
-                    if len(arr) > 96:
-                        idx = np.linspace(0, len(arr) - 1, 64).astype(int)
+                    if len(arr) > 160:
+                        idx = np.linspace(0, len(arr) - 1, 128).astype(int)
                         pts = arr[idx]
                     else:
                         pts = arr
@@ -308,7 +308,7 @@ class DebugVisualizer:
         self.save_edge_polylines(base_rgb, after_edges, name="01d_edges_bezier_after_fit", width=1)
 
     def save_contours(self, base_rgb: NDArray[np.generic] | U8Arr, regions: Iterable[Region]) -> None:
-        """区域外轮廓（密重采样为主，叠加拟合多边形）。"""
+        """区域外轮廓：彩色=完整共享边环，白线=描述子重采样（均与 after_fit 同源）。"""
         base = _as_rgb_u8(base_rgb)
         img = Image.fromarray(base.copy(), mode="RGB")
         draw = ImageDraw.Draw(img)

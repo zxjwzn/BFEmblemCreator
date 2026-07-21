@@ -1,4 +1,4 @@
-"""图章匹配装配器：区域覆盖 + 残差 + 特效 + 装配。"""
+"""图章匹配装配器：构造式同色覆盖 + 约束补缝 + 特效 + 装配。"""
 
 from __future__ import annotations
 
@@ -7,23 +7,22 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field
 
 from bf_emblem_creator.approx.assemble import assemble_layers, composite_layers
-from bf_emblem_creator.approx.color import rgb_to_hex
 from bf_emblem_creator.approx.contour_arcs import ArcPrimitive
-from bf_emblem_creator.approx.curves import (
-    contour_curvature_descriptor,
-    fit_mask_contour_high_precision,
-    mask_to_sdf,
-)
 from bf_emblem_creator.approx.debug_vis import DebugVisualizer, stamp_layer_rings_on_canvas
+from bf_emblem_creator.approx.depth_order import EdgeRole
 from bf_emblem_creator.approx.planar_map import face_shape_boundary_points
 from bf_emblem_creator.approx.processors.image_processor import ProcessedImage
 from bf_emblem_creator.approx.processors.region_partitioner import RegionPartition
 from bf_emblem_creator.approx.processors.stamp_loader import StampCatalog
 from bf_emblem_creator.approx.processors.stamp_renderer import StampRenderer
 from bf_emblem_creator.approx.recipe import AngleMode, StampMatchAssemblerConfig
-from bf_emblem_creator.approx.regions import Region, _label_ccs
+from bf_emblem_creator.approx.regions import Region
 from bf_emblem_creator.approx.special_fx import try_special_fx_layers
-from bf_emblem_creator.approx.union_cover import cover_region_with_union_stamps
+from bf_emblem_creator.approx.union_cover import (
+    constrained_gap_fill,
+    cover_region_with_union_stamps,
+    resolve_target_curve,
+)
 from bf_emblem_creator.models import EmblemDocument, StampLayer
 
 FloatArr = NDArray[np.floating]
@@ -83,6 +82,90 @@ def _snap_layer_angle(layer: StampLayer, cfg: StampMatchAssemblerConfig) -> Stam
     return layer.model_copy(update={"angle": best})
 
 
+def _face_gamma(pmap: object, region: Region) -> FloatArr:
+    """Face 曲线真源 Γ_F：SharedEdge after_fit / dense。"""
+    from bf_emblem_creator.approx.planar_map import PlanarMap
+
+    if isinstance(pmap, PlanarMap):
+        edge_tgt = face_shape_boundary_points(pmap, region.region_id, only_shape=True)
+        if len(edge_tgt) >= 4:
+            return np.asarray(edge_tgt, dtype=np.float64)
+    return resolve_target_curve(region, None)
+
+
+def _occlusion_carve_layers(
+    layers: list[StampLayer],
+    pmap: object,
+    regions: list[Region],
+    curve_lib: object,
+    renderer: object,
+    *,
+    layer_budget: int,
+    seed: int,
+    uc_max_stamps: int,
+) -> list[StampLayer]:
+    """
+    异色切边轻量修补：对 OCCLUSION_CUT 边，在上层 Face 再补 0～1 枚贴边章。
+
+    首版只对「上层」Face 用 cut 边点云做一次构造覆盖追加。
+    """
+    from bf_emblem_creator.approx.planar_map import PlanarMap
+    from bf_emblem_creator.approx.stamp_curves import StampCurveLibrary
+    from bf_emblem_creator.approx.torch_render import TorchStampRenderer
+
+    if not isinstance(pmap, PlanarMap):
+        return layers
+    if not isinstance(curve_lib, StampCurveLibrary) or not isinstance(renderer, TorchStampRenderer):
+        return layers
+    if len(layers) >= layer_budget:
+        return layers
+
+    by_id = {r.region_id: r for r in regions}
+    depth_of = {r.region_id: int(r.depth) for r in regions}
+    out = list(layers)
+    carved = 0
+    for e in pmap.edges:
+        if carved >= 4 or len(out) >= layer_budget:
+            break
+        if e.role != EdgeRole.occlusion_cut:
+            continue
+        fa, fb = int(e.left_face), int(e.right_face)
+        if fa < 0 or fb < 0:
+            continue
+        # 上层 = depth 更大
+        up = fa if depth_of.get(fa, 0) >= depth_of.get(fb, 0) else fb
+        reg = by_id.get(up)
+        if reg is None or max(reg.color_rgb) < 25:
+            continue
+        poly = np.asarray(e.polyline, dtype=np.float64)
+        if len(poly) < 4:
+            continue
+        remain = layer_budget - len(out)
+        more = cover_region_with_union_stamps(
+            reg,
+            curve_lib,
+            renderer,
+            target_curve_pts=poly,
+            n_particles=96,
+            recall_k=16,
+            seed=seed + 5000 + e.id,
+            prefer_primitive_seed=False,
+            refine=True,
+            refine_iters=1,
+            max_stamps=min(1, uc_max_stamps, remain),
+            min_cover=0.55,
+            min_cover_gain=0.02,
+            max_leak=0.4,
+            layer_budget=remain,
+            enable_canvas_clip=True,
+            max_boundary_chamfer=10.0,
+        )
+        if more:
+            out.append(more[0])
+            carved += 1
+    return out
+
+
 class StampMatchAssembler:
     """图章匹配装配器。"""
 
@@ -104,7 +187,7 @@ class StampMatchAssembler:
         particles: int | None = None,
         dbg: DebugVisualizer | None = None,
     ) -> AssemblyResult:
-        """区域匹配 → 残差补层 → 特效 → 装配截断。"""
+        """构造式覆盖 → 异色切边 → 约束补缝 → 特效 → 装配截断。"""
         cfg = self.config
         n_particles = int(particles if particles is not None else cfg.n_particles)
         curve_lib = self.catalog.get_curve_lib()
@@ -118,11 +201,7 @@ class StampMatchAssembler:
         alpha = np.asarray(image.alpha, dtype=np.float64)
         src_rgb = np.asarray(image.src_rgb, dtype=np.uint8)
 
-        # 资产过滤：仅保留 catalog 允许的 id
         allowed = set(cfg.allowed_assets) if cfg.allowed_assets is not None else set(self.catalog.allowed_ids)
-        if allowed:
-            # StampCurveLibrary 无运行时 filter；靠 subset 已在 loader 限制
-            pass
 
         layers: list[StampLayer] = []
         special_assets: list[str] = []
@@ -131,15 +210,20 @@ class StampMatchAssembler:
         ordered_items = list(depth.ordered)
         uc = cfg.union_cover
 
+        # Face → Γ_F 缓存（约束补缝复用）
+        face_curves: dict[int, FloatArr] = {}
+        regions_list: list[Region] = [item.region for item in ordered_items]
+
+        # —— Phase 1：同色构造覆盖（全程 after_fit 曲线）——
+        n_union_stamps = 0
         for item in ordered_items:
             if len(layers) >= place_budget:
                 break
             region = item.region
             if max(region.color_rgb) < 25:
                 continue
-            edge_tgt = face_shape_boundary_points(pmap, region.region_id, only_shape=True)
-            if len(edge_tgt) < 4:
-                edge_tgt = None
+            gamma = _face_gamma(pmap, region)
+            face_curves[region.region_id] = gamma
             remain = place_budget - len(layers)
             if remain <= 0:
                 break
@@ -149,7 +233,7 @@ class StampMatchAssembler:
                 curve_lib,
                 ren,
                 primitives=prims,
-                target_curve_pts=edge_tgt,
+                target_curve_pts=gamma if len(gamma) >= 4 else None,
                 n_particles=n_particles,
                 recall_k=cfg.recall_k,
                 seed=cfg.seed + region.region_id * 3,
@@ -161,6 +245,8 @@ class StampMatchAssembler:
                 min_cover_gain=uc.min_cover_gain,
                 max_leak=uc.max_leak,
                 layer_budget=remain,
+                enable_canvas_clip=bool(uc.enable_canvas_clip),
+                max_boundary_chamfer=float(uc.max_boundary_chamfer),
             )
             for layer in new_layers:
                 if allowed and layer.asset not in allowed:
@@ -170,6 +256,7 @@ class StampMatchAssembler:
                     s = max(float(layer.width), float(layer.height))
                     layer = layer.model_copy(update={"width": s, "height": s})
                 layers.append(layer)
+                n_union_stamps += 1
                 if dbg is not None and dbg.enabled:
                     curve_xy = _accepted_match_curve(self.catalog, layer)
                     dbg.save_accepted_match(
@@ -180,106 +267,76 @@ class StampMatchAssembler:
                         layer_index=len(layers) - 1,
                     )
 
-        residual_cap = place_budget
-        residual_rounds = max(2, min(20, residual_cap - len(layers) + 2))
-        stall = 0
-        rnd = 0
-        residual_dumped = False
-        while len(layers) < residual_cap and rnd < residual_rounds:
-            rnd += 1
-            pred_rgb, pred_a = composite_layers(layers, ren)
-            tgt_rgb = np.asarray(graph.image_rgb, dtype=np.float64)
-            err = np.linalg.norm(pred_rgb.astype(np.float64) - tgt_rgb, axis=2) / 255.0
-            need = (alpha >= 0.5) & ((pred_a < 0.4) | (err > 0.22))
-            if dbg is not None and dbg.enabled and not residual_dumped:
+        # —— Phase 2：异色切边 ——
+        if uc.enable_occlusion_carve and len(layers) < place_budget:
+            before = len(layers)
+            layers = _occlusion_carve_layers(
+                layers,
+                pmap,
+                regions_list,
+                curve_lib,
+                ren,
+                layer_budget=place_budget,
+                seed=cfg.seed,
+                uc_max_stamps=int(uc.max_stamps_per_region),
+            )
+            layers = [_snap_layer_angle(layer, cfg) for layer in layers]
+            if len(layers) > before:
+                logs.append(f"occlusion_carve +{len(layers) - before}")
+
+        # —— Phase 3：约束补缝（曲线回绑 Face，禁止自由 r9xxx 轮廓）——
+        if uc.enable_constrained_gap_fill and len(layers) < place_budget:
+            # 确保每个 region 有曲线缓存
+            for reg in regions_list:
+                if reg.region_id not in face_curves:
+                    face_curves[reg.region_id] = _face_gamma(pmap, reg)
+            before = len(layers)
+            if dbg is not None and dbg.enabled:
+                pred_rgb, pred_a = composite_layers(layers, ren)
+                err = (
+                    np.linalg.norm(pred_rgb.astype(np.float64) - np.asarray(graph.image_rgb, dtype=np.float64), axis=2) / 255.0
+                )
+                need = (alpha >= 0.5) & ((pred_a < 0.4) | (err > 0.22))
                 dbg.save_residual(err, need)
-                residual_dumped = True
-            if not need.any():
-                break
-            ccs = _label_ccs(need.astype(bool), device=ren.device)
-            ccs.sort(key=lambda m: -int(m.sum()))
-            gained = False
-            min_pix = image.meta.canvas_size**2 * 0.0015 * 0.5
-            for m in ccs[:4]:
-                if len(layers) >= residual_cap:
-                    break
-                if float(m.sum()) < min_pix:
-                    continue
-                med = np.median(tgt_rgb[m], axis=0)
-                rgb = (int(med[0]), int(med[1]), int(med[2]))
-                if max(rgb) < 25:
-                    continue
-                outer, _holes, rs, _err = fit_mask_contour_high_precision(m, resample_n=96)
-                if len(outer) < 3:
-                    ys, xs = np.where(m)
-                    outer = np.array(
-                        [
-                            [float(xs.min()), float(ys.min())],
-                            [float(xs.max()), float(ys.min())],
-                            [float(xs.max()), float(ys.max())],
-                            [float(xs.min()), float(ys.max())],
-                            [float(xs.min()), float(ys.min())],
-                        ],
-                        dtype=np.float64,
-                    )
-                    rs = outer
-                ys, xs = np.where(m)
-                region = Region(
-                    region_id=9000 + rnd,
-                    color_hex=rgb_to_hex(rgb),
-                    color_rgb=rgb,
-                    area_frac=float(m.sum()) / float(m.size),
-                    bbox=(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
-                    mask=m,
-                    contour=outer,
-                    contour_resampled=rs,
-                    descriptor=contour_curvature_descriptor(rs if len(rs) >= 8 else outer),
-                    sdf=mask_to_sdf(m),
-                    depth=len(layers),
-                    centroid=(float(xs.mean()), float(ys.mean())),
-                )
-                remain = residual_cap - len(layers)
-                more = cover_region_with_union_stamps(
-                    region,
-                    curve_lib,
-                    ren,
-                    primitives=prims,
-                    n_particles=max(96, n_particles // 2),
-                    recall_k=min(cfg.recall_k, 32),
-                    seed=cfg.seed + 1000 + rnd,
-                    prefer_primitive_seed=cfg.prefer_primitive_seed,
-                    refine=cfg.refine,
-                    refine_iters=max(1, cfg.refine_iters),
-                    max_stamps=min(2, int(uc.max_stamps_per_region), remain),
-                    min_cover=max(0.55, uc.min_cover - 0.15),
-                    min_cover_gain=uc.min_cover_gain,
-                    max_leak=min(0.55, uc.max_leak + 0.1),
-                    layer_budget=remain,
-                )
-                if not more:
-                    continue
-                for cand in more:
-                    if allowed and cand.asset not in allowed:
-                        continue
-                    cand = _snap_layer_angle(cand, cfg)
-                    layers.append(cand)
-                    if dbg is not None and dbg.enabled:
-                        curve_xy = _accepted_match_curve(self.catalog, cand)
+            layers = constrained_gap_fill(
+                layers,
+                regions_list,
+                face_curves,
+                curve_lib,
+                ren,
+                alpha=alpha,
+                target_rgb=np.asarray(graph.image_rgb, dtype=np.uint8),
+                max_rounds=max(2, min(8, place_budget - len(layers))),
+                max_stamps_per_gap=2,
+                layer_budget=place_budget,
+                n_particles=max(96, n_particles // 2),
+                recall_k=min(cfg.recall_k, 32),
+                seed=cfg.seed + 1000,
+                min_cover=max(0.78, uc.min_cover - 0.1),
+                max_leak=max(0.45, uc.max_leak),
+            )
+            layers = [_snap_layer_angle(layer, cfg) for layer in layers]
+            if len(layers) > before:
+                logs.append(f"constrained_gap_fill +{len(layers) - before}")
+                if dbg is not None and dbg.enabled:
+                    # 仅记录补缝新增层（用归属 region 轮廓可视化）
+                    for i, layer in enumerate(layers[before:], start=before):
+                        # 找颜色最接近的 region 作 debug 底
+                        reg_dbg = regions_list[0] if regions_list else None
+                        for reg in regions_list:
+                            if str(reg.color_hex).lower() == str(layer.fill).lower():
+                                reg_dbg = reg
+                                break
+                        if reg_dbg is None:
+                            continue
+                        curve_xy = _accepted_match_curve(self.catalog, layer)
                         dbg.save_accepted_match(
                             base_rgb=image_q,
-                            region=region,
-                            layer=cand,
+                            region=reg_dbg,
+                            layer=layer,
                             stamp_curve_canvas=curve_xy,
-                            layer_index=len(layers) - 1,
+                            layer_index=i,
                         )
-                gained = True
-                break
-            if not gained:
-                stall += 1
-                if stall >= cfg.stall_patience:
-                    break
-            else:
-                stall = 0
 
         if cfg.enable_special_fx and len(layers) < cfg.max_layers:
             fx = try_special_fx_layers(
@@ -303,7 +360,6 @@ class StampMatchAssembler:
             max_layers=cfg.max_layers,
             target_boundary_pts=boundary_pts,
         )
-        # 再投影角度（装配可能未改）
         layers = [_snap_layer_angle(layer, cfg) for layer in layers]
         if dbg is not None and dbg.enabled:
             pred_rgb, pred_a = composite_layers(layers, ren)
@@ -311,7 +367,8 @@ class StampMatchAssembler:
             dbg.save_composite("09_assembled", rgba)
 
         logs.append(
-            f"assemble layers={len(layers)} boundary={float(bscore):.3f} seam_p95={float(seam):.2f} fx={special_assets}"
+            f"assemble layers={len(layers)} union_phase_stamps={n_union_stamps} "
+            f"boundary={float(bscore):.3f} seam_p95={float(seam):.2f} fx={special_assets}"
         )
         return AssemblyResult(
             layers=layers,

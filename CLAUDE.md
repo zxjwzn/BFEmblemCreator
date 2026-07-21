@@ -40,6 +40,7 @@ uv run pytest
 |------|------|
 | `docs/technical-design.md` | 技术方案 |
 | `docs/architecture-refactor.md` | 近似管线架构重构（模式配方 / 处理器类 / pixel） |
+| `docs/stamp-constructive-matching.md` | 图章构造式匹配（同色并集 / 异色遮挡 / 画布裁切） |
 | `docs/coding-conventions.md` | 编码规范（含中文注解、无版本分叉） |
 | `src/bf_emblem_creator/` | 主代码 |
 | `examples/sample_emblem.json` | 示例导出 |

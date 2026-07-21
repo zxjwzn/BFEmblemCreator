@@ -229,15 +229,16 @@ def match_region_with_particles(
     """
     对区域做曲线导向的大尺度粒子搜索。
 
-    target_curve_pts：可选，来自 SharedEdge 去重后的 SHAPE 边界点。
-    未提供时回退 region.contour_resampled。
+    target_curve_pts：图章曲线拟合参考，应来自 SharedEdge.polyline
+    （curve_fit 模式下即 edges_bezier_after_fit）。
+    未提供时回退 region.contour_resampled（Region 轮廓已与共享边同源）。
     """
     device = renderer.device
     cs = float(renderer.canvas_size)
     cx, cy, bw, bh, pang, circ, elong = _region_geom(region)
     desc = np.asarray(region.descriptor, dtype=np.float64)
 
-    # 目标曲线点：优先共享边去重点云
+    # 目标曲线点：优先外部传入的共享边点云（after_fit / dense）
     if target_curve_pts is not None and len(np.asarray(target_curve_pts)) >= 4:
         tgt_pts_np = np.asarray(target_curve_pts, dtype=np.float32)
     else:

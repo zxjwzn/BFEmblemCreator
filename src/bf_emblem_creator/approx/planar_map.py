@@ -743,54 +743,90 @@ def walk_face_halfedges(pmap: PlanarMap, face_id: int) -> list[HalfEdge]:
     return out
 
 
+def _assemble_face_ring_polyline(
+    pmap: PlanarMap,
+    face_id: int,
+    *,
+    only_shape: bool = False,
+    max_join_gap: float = 6.0,
+) -> FloatArr | None:
+    """
+    沿半边环拼接 SharedEdge.polyline 为闭合轮廓。
+
+    几何源唯一：边的 polyline（dense 或 curve_fit 后的贝塞尔采样）。
+    仅当环为空或接缝过大时返回 None；**不因穿心弦丢弃**（拟合后宏观弦合法）。
+    """
+    f = pmap.face_by_id().get(face_id)
+    if f is None:
+        return None
+    e_by = pmap.edge_by_id()
+    ring = walk_face_halfedges(pmap, face_id)
+    if not ring:
+        return None
+
+    # 优先开放边；若环上仅有自环（整圈闭合外边界）则保留自环
+    open_he: list[HalfEdge] = []
+    loop_he: list[HalfEdge] = []
+    for he in ring:
+        e = e_by[he.edge_id]
+        if only_shape and e.role == EdgeRole.occlusion_cut:
+            continue
+        poly = np.asarray(e.polyline, dtype=np.float64)
+        if len(poly) < 2:
+            continue
+        if e.v0 == e.v1 and len(poly) > 4:
+            loop_he.append(he)
+        else:
+            open_he.append(he)
+    use = open_he if open_he else (loop_he if loop_he else list(ring))
+
+    chunks: list[FloatArr] = []
+    max_gap = 0.0
+    for he in use:
+        e = e_by[he.edge_id]
+        poly = np.asarray(e.polyline, dtype=np.float64)
+        if he.direction < 0:
+            poly = poly[::-1].copy()
+        if chunks and len(poly) > 0:
+            gap = float(np.linalg.norm(chunks[-1][-1] - poly[0]))
+            max_gap = max(max_gap, gap)
+            if gap < max_join_gap:
+                poly = poly.copy()
+                poly[0] = chunks[-1][-1]
+                if len(poly) > 1:
+                    poly = poly[1:]
+        if len(poly):
+            chunks.append(poly)
+    if not chunks:
+        return None
+    cont = np.vstack(chunks)
+    if len(cont) < 2:
+        return None
+    close_gap = float(np.linalg.norm(cont[0] - cont[-1]))
+    max_gap = max(max_gap, close_gap)
+    if close_gap > 1e-6:
+        cont = np.vstack([cont, cont[:1]])
+    # 拟合后端点可能有亚像素缝；放宽阈值，优先保留共享边环
+    if max_gap > max_join_gap:
+        return None
+    if len(cont) < 3:
+        return None
+    return cont
+
+
 def face_contour(pmap: PlanarMap, face_id: int) -> FloatArr:
     """
-    Face 外轮廓：优先半边环拼接 dual 精确边界；
+    Face 外轮廓：优先半边环拼接 SharedEdge.polyline（dense / 贝塞尔拟合后）。
 
-    接缝过大/穿心弦则回退 mask Moore 精确跟踪（**禁止**圆椭圆概括）。
+    仅在环拼接失败时回退 mask Moore 精确跟踪（**禁止**圆椭圆概括）。
+    拟合后的宏观弦不再触发回退，保证与 edges_bezier_after_fit 同源。
     """
     f = pmap.face_by_id().get(face_id)
     if f is None:
         return np.zeros((0, 2), dtype=np.float64)
     mask = np.asarray(f.mask, dtype=bool)
-    e_by = pmap.edge_by_id()
-    ring = walk_face_halfedges(pmap, face_id)
-    cont: FloatArr | None = None
-    if ring:
-        open_ring: list[HalfEdge] = []
-        for he in ring:
-            e = e_by[he.edge_id]
-            if e.v0 == e.v1 and len(np.asarray(e.polyline)) > 4:
-                continue
-            open_ring.append(he)
-        use = open_ring if open_ring else ring
-        chunks: list[FloatArr] = []
-        max_gap = 0.0
-        for he in use:
-            e = e_by[he.edge_id]
-            poly = np.asarray(e.polyline, dtype=np.float64)
-            if he.direction < 0:
-                poly = poly[::-1].copy()
-            if chunks and len(poly) > 0:
-                gap = float(np.linalg.norm(chunks[-1][-1] - poly[0]))
-                max_gap = max(max_gap, gap)
-                if gap < 2.5:
-                    poly = poly.copy()
-                    poly[0] = chunks[-1][-1]
-                    if len(poly) > 1:
-                        poly = poly[1:]
-            if len(poly):
-                chunks.append(poly)
-        if chunks:
-            cont = np.vstack(chunks)
-            if len(cont) >= 2:
-                close_gap = float(np.linalg.norm(cont[0] - cont[-1]))
-                max_gap = max(max_gap, close_gap)
-                if close_gap > 1e-6:
-                    cont = np.vstack([cont, cont[:1]])
-            if max_gap > 3.0:
-                cont = None
-    if cont is not None and len(cont) >= 3 and not _contour_has_interior_chords(cont, mask):
+    cont = _assemble_face_ring_polyline(pmap, face_id, only_shape=False)
+    if cont is not None and len(cont) >= 3:
         return cont
     return _exact_mask_outer_contour(mask)
 
@@ -803,37 +839,49 @@ def face_shape_boundary_points(
     max_points: int = 512,
 ) -> FloatArr:
     """
-    某 Face 的 SHAPE_BOUNDARY 目标点：关联 SharedEdge 精确折线，按 edge_id 去重。
+    某 Face 的形状目标曲线点：与 after_fit / dense 共享边同源。
 
-    默认保留更多点（精确描边，不抽稀成几何原语）。
+    优先半边环有序拼接（匹配 Chamfer 与 Region.contour 一致）；
+    环失败时再按 edge_id 去重堆叠各边 polyline。
     """
-    pts: list[FloatArr] = []
-    seen_e: set[int] = set()
-    for e in pmap.edges:
-        if e.id in seen_e:
-            continue
-        if e.left_face != face_id and e.right_face != face_id:
-            continue
-        if only_shape and e.role == EdgeRole.occlusion_cut:
-            continue
-        seen_e.add(e.id)
-        poly = np.asarray(e.polyline, dtype=np.float64)
-        if len(poly) >= 2:
-            pts.append(poly)
-    if not pts:
-        return np.zeros((0, 2), dtype=np.float64)
-    all_p = np.vstack(pts)
+    ordered = _assemble_face_ring_polyline(pmap, face_id, only_shape=only_shape)
+    if ordered is not None and len(ordered) >= 4:
+        all_p = ordered
+        if len(all_p) > 1 and float(np.linalg.norm(all_p[0] - all_p[-1])) < 1e-6:
+            all_p = all_p[:-1]
+    else:
+        pts: list[FloatArr] = []
+        seen_e: set[int] = set()
+        for e in pmap.edges:
+            if e.id in seen_e:
+                continue
+            if e.left_face != face_id and e.right_face != face_id:
+                continue
+            if only_shape and e.role == EdgeRole.occlusion_cut:
+                continue
+            seen_e.add(e.id)
+            poly = np.asarray(e.polyline, dtype=np.float64)
+            if len(poly) >= 2:
+                pts.append(poly)
+        if not pts:
+            # 最后回退：完整 face 轮廓（仍优先共享边环，失败才 Moore）
+            cont = face_contour(pmap, face_id)
+            if len(cont) < 4:
+                return np.zeros((0, 2), dtype=np.float64)
+            all_p = cont[:-1] if len(cont) > 1 and float(np.linalg.norm(cont[0] - cont[-1])) < 1e-6 else cont
+        else:
+            all_p = np.vstack(pts)
     if len(all_p) > max_points:
         idx = np.linspace(0, len(all_p) - 1, max_points).astype(int)
         all_p = all_p[idx]
-    return all_p
+    return np.asarray(all_p, dtype=np.float64)
 
 
 def planar_map_to_region_graph(
     pmap: PlanarMap,
     palette: list[PaletteColor] | None = None,
 ) -> RegionGraph:
-    """PlanarMap → RegionGraph：轮廓为精确边界描边（半边拼接 / Moore）。"""
+    """PlanarMap → RegionGraph：轮廓与 SharedEdge.polyline 同源（拟合后即 after_fit）。"""
     _ = palette
     regions: list[Region] = []
     for f in pmap.faces:
@@ -849,7 +897,7 @@ def planar_map_to_region_graph(
                 ],
                 dtype=np.float64,
             )
-        # 重采样仅用于描述子，保留完整精确轮廓在 contour
+        # 重采样仅用于描述子；完整轮廓保留共享边几何
         if len(cont) >= 3:
             n_rs = min(256, max(64, len(cont)))
             rs = cont if len(cont) <= n_rs else resample_closed_contour(cont, n_rs)
@@ -859,6 +907,7 @@ def planar_map_to_region_graph(
         mask = np.asarray(f.mask, dtype=bool)
         mask_a = float(mask.sum())
         area_err = area_relative_error(polygon_area(cont), mask_a)
+        # 拟合宏观弦可能穿区：仅抬高误差标记，不改轮廓源
         if _contour_has_interior_chords(cont, mask):
             area_err = max(area_err, 0.5)
         regions.append(

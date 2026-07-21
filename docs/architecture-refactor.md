@@ -15,8 +15,16 @@ approximate_image(image, recipe: ModeRecipe | None)
        ├─ ImageProcessor → ProcessedImage
        ├─ RegionPartitioner → RegionPartition
        │     └─ curve_fit 时 simplify_planar_map_curves（chain 贝塞尔）
+       │         → SharedEdge.polyline 写回后：
+       │           Region.contour / face_shape_boundary_points / 匹配目标 同源
        └─ StampMatchAssembler → EmblemDocument
+            ├─ Phase1 Cover-Union：每 Face 同色多章，目标=after_fit Γ_F
+            ├─ Phase2 Occlusion-Carve（可选）
+            └─ Phase3 ConstrainedGapFill：补缝回绑 Face/Γ_F
 ```
+
+> 设计与参数：[`stamp-constructive-matching.md`](./stamp-constructive-matching.md)  
+> 实现：`approx/union_cover.py`、`processors/match_assembler.py`；测试 `tests/test_constructive_cover.py`
 
 | 组件 | 路径 |
 |------|------|

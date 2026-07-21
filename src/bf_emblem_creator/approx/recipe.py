@@ -129,14 +129,23 @@ class RegionPartitionerConfig(BaseModel):
 
 
 class UnionCoverConfig(BaseModel):
-    """同色多图章并集覆盖。"""
+    """同色构造覆盖（并集外轮廓贴合贝塞尔）。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    max_stamps_per_region: int = Field(default=4, ge=1, le=12, description="每区最多同色章")
-    min_cover: float = Field(default=0.82, ge=0.3, le=1.0, description="覆盖目标")
-    min_cover_gain: float = Field(default=0.045, ge=0.0, le=0.5, description="追加最小增益")
-    max_leak: float = Field(default=0.42, ge=0.0, le=1.0, description="最大泄漏比")
+    max_stamps_per_region: int = Field(default=5, ge=1, le=12, description="每区最多同色章（并集）")
+    min_cover: float = Field(default=0.90, ge=0.3, le=1.0, description="同色并集覆盖目标")
+    min_cover_gain: float = Field(default=0.02, ge=0.0, le=0.5, description="追加最小增益")
+    max_leak: float = Field(
+        default=0.48,
+        ge=0.0,
+        le=1.0,
+        description="泄漏软阈值（同色可溢，供上层异色遮挡；裁切大章合法）",
+    )
+    enable_canvas_clip: bool = Field(default=True, description="画布正方形裁切提案（章可出界）")
+    max_boundary_chamfer: float = Field(default=5.0, ge=0.5, le=40.0, description="并集外轮廓贴 Γ_F 的达标 Chamfer")
+    enable_occlusion_carve: bool = Field(default=True, description="异色上层贴 CUT 边（遮挡造型）")
+    enable_constrained_gap_fill: bool = Field(default=True, description="约束补缝（曲线回绑 Face）")
 
 
 class StampMatchAssemblerConfig(BaseModel):
