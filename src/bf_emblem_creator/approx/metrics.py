@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import torch
 from numpy.typing import NDArray
@@ -97,7 +95,7 @@ def extract_visible_curve_points(rgb: U8Arr, alpha: FloatArr, n: int = 128) -> F
             xs, ys = xs[idx], ys[idx]
         pts = torch.stack([xs.float(), ys.float()], dim=1).detach().cpu().numpy().astype(np.float64)
         return resample_closed_contour(pts, n) if len(pts) >= 4 else pts
-    cont = extract_outer_contour(alpha >= 0.5, simplify=1.0)
+    cont = extract_outer_contour(alpha >= 0.5, simplify=0.0)
     if cont is None or len(cont) < 4:
         return np.zeros((0, 2), dtype=np.float64)
     return resample_closed_contour(cont, n)
@@ -129,7 +127,7 @@ def target_curve_from_blocks(target: BlockTarget) -> FloatArr:
         if len(c):
             pts.append(c)
     if not pts:
-        cont = extract_outer_contour(target.numpy_alpha() >= 0.5, simplify=1.2)
+        cont = extract_outer_contour(target.numpy_alpha() >= 0.5, simplify=0.0)
         if cont is None:
             return np.zeros((0, 2), dtype=np.float64)
         return resample_closed_contour(cont, 128)
@@ -269,9 +267,3 @@ def score_prediction(
         curve_chamfer=chamfer,
         notes=notes,
     )
-
-
-def score_fit(pred: Image.Image | U8Arr, target: BlockTarget, **kwargs: Any) -> FullScoreReport:
-    """兼容入口。"""
-    n_layers = int(kwargs.pop("n_layers", 1))
-    return score_prediction(pred, target, n_layers=n_layers, **kwargs)

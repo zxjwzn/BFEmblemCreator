@@ -493,7 +493,7 @@ def approximate(image, stamps_index, max_layers=40) -> EmblemDocument:
 
 新增模型建议（仍 Pydantic）：
 
-- `ApproxConfig`：max_layers, min_gain, palette_k, stamp_subset, pyramid_sizes…  
+- `ApproxConfig`：max_layers, min_gain, num_colors, stamp_subset, …  
 - `StampIndex` / `StampFeatures`：构建缓存元数据  
 - `RoiProposal`：bbox, mask, score, suggest_tags  
 - `ApproxResult`：document, final_loss, per_layer_gains, debug_images  
@@ -506,7 +506,7 @@ def approximate(image, stamps_index, max_layers=40) -> EmblemDocument:
 |------|------|------|
 | max_layers | 40 | 硬上限 |
 | min_gain | 相对 loss 0.5% 或绝对阈值 | 防碎层 |
-| palette_k | 6 | 色量 |
+| num_colors | 6 | 严格 LAB 色量 K |
 | recall_k | 12 | 短名单 |
 | angle_coarse | 15° | 离散 |
 | search_res | 128 | 几何匹配 |
@@ -540,8 +540,3 @@ def approximate(image, stamps_index, max_layers=40) -> EmblemDocument:
 
 ---
 
-## 修订
-
-| 版本 | 日期 | 说明 |
-|------|------|------|
-| 0.1 | 2026-07-19 | 初稿：MP 主路径、阶段、接口、分期、超参 |

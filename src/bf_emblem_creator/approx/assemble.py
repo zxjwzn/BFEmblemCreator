@@ -1,4 +1,4 @@
-"""P8：层栈装配与遮挡一致性校验（GPU 合成/剪枝/Chamfer）。"""
+"""层栈装配与遮挡一致性校验（GPU 合成/剪枝/Chamfer）。"""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def boundary_consistency_score(
     edge = visible_boundary_mask(pred_rgb, pred_alpha)
     ys, xs = np.where(edge)
     if len(xs) < 8:
-        cont = extract_outer_contour(pred_alpha >= 0.5, simplify=1.0)
+        cont = extract_outer_contour(pred_alpha >= 0.5, simplify=0.0)
         if cont is None or len(cont) < 4:
             return 0.3
         pred_pts = resample_closed_contour(cont, 96)
@@ -92,7 +92,7 @@ def seam_p95_against_targets(
     edge = visible_boundary_mask(pred_rgb, pred_alpha)
     ys, xs = np.where(edge)
     if len(xs) < 4:
-        cont = extract_outer_contour(pred_alpha >= 0.5, simplify=1.0)
+        cont = extract_outer_contour(pred_alpha >= 0.5, simplify=0.0)
         if cont is None or len(cont) < 4:
             return 99.0
         pred_pts = resample_closed_contour(cont, 96)

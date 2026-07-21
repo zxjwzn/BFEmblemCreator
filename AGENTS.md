@@ -1,4 +1,4 @@
-# BFEmblemCreator — Claude 项目说明
+# BFEmblemCreator — Codex 项目说明
 
 ## 项目
 

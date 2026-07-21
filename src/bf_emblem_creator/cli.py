@@ -1,4 +1,4 @@
-"""命令行：徽章 JSON 渲染、校验、v3 图像近似、图章曲线预拟合。"""
+"""命令行：徽章 JSON 渲染、校验、图像近似、图章曲线预拟合。"""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from pydantic import ValidationError
 
 from bf_emblem_creator.approx.blocks import abstract_to_blocks
 from bf_emblem_creator.approx.metrics import score_prediction
-from bf_emblem_creator.approx.models import AbstractionMode, ApproxConfig
+from bf_emblem_creator.approx.models import AbstractionMode
 from bf_emblem_creator.approx.pipeline import approximate_image
+from bf_emblem_creator.approx.recipe import default_recipe_for_mode
 from bf_emblem_creator.approx.stamp_curves import StampCurveLibrary
 from bf_emblem_creator.models import CanvasConfig, EmblemDocument, HexColor, RenderConfig
 from bf_emblem_creator.render import EmblemRenderer
@@ -19,7 +20,7 @@ from bf_emblem_creator.stamps import StampLibrary
 
 app = typer.Typer(
     name="bfemblem",
-    help="战地图章徽章：离线渲染与自动近似（v3 可见边界曲线拟合）",
+    help="战地图章徽章：离线渲染与自动近似（ModeRecipe + 五大处理器）",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -165,10 +166,19 @@ def approx_cmd(
         int,
         typer.Option("--max-layers", min=1, max=40, help="图层上限（默认 40）"),
     ] = 40,
-    palette_k: Annotated[int, typer.Option("--palette-k", min=2, max=16, help="起始色量 K（由简入繁，默认 4）")] = 4,
+    num_colors: Annotated[
+        int,
+        typer.Option("--num-colors", "-k", min=2, max=64, help="严格 LAB 色量 K"),
+    ] = 6,
     pass_score: Annotated[float, typer.Option("--pass-score", min=0.0, max=1.0)] = 0.48,
     particles: Annotated[int, typer.Option("--particles", min=32, max=4096, help="每区域粒子数")] = 384,
-    mode: Annotated[AbstractionMode, typer.Option("--mode")] = AbstractionMode.auto,
+    mode: Annotated[
+        AbstractionMode,
+        typer.Option(
+            "--mode",
+            help="概括模式：logo/illustration/photo_portrait/photo_general/silhouette/pixel（默认 illustration）",
+        ),
+    ] = AbstractionMode.illustration,
     cpu: Annotated[bool, typer.Option("--cpu", help="强制 CPU")] = False,
     no_fx: Annotated[bool, typer.Option("--no-fx", help="禁用特殊图章渐变通道")] = False,
     debug_dir: Annotated[
@@ -176,31 +186,31 @@ def approx_cmd(
         typer.Option(
             "--debug-dir",
             "-d",
-            help="逐步调试图目录（平面化/区域/轮廓/基元/通过的匹配/合成）；不写粒子搜索过程",
+            help="逐步调试图目录；不写粒子搜索过程",
         ),
     ] = None,
 ) -> None:
-    """v3：可见边界曲线拟合 + 多级 K + GPU 粒子（输出 JSON 与预览）。"""
+    """ModeRecipe 近似：平面化 + 共享边贝塞尔 + 图章匹配（输出 JSON 与预览）。"""
     from PIL import Image
 
-    cfg = ApproxConfig(
+    recipe = default_recipe_for_mode(mode).override(
         stamps_dir=stamps_dir or _default_stamps_dir(),
         max_layers=max_layers,
-        palette_k=palette_k,
-        k_start=palette_k,
+        num_colors=num_colors,
         pass_score=pass_score,
-        mode=mode,
+        n_particles=particles,
+        use_cuda=not cpu,
         enable_special_fx=not no_fx,
         debug_dir=debug_dir,
     )
-    result = approximate_image(input_image, cfg, n_particles=particles, use_cuda=not cpu)
+    result = approximate_image(input_image, recipe, n_particles=particles)
     result.document.save_json(output)
     if preview is not None and result.preview_rgb is not None:
         preview.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(result.preview_rgb, mode="RGBA").save(preview)
     typer.echo(
         f"已写入 {output}（{len(result.document)}/{max_layers} 层，"
-        f"区域={result.blocks_found}，K={result.k_used}，"
+        f"区域={result.blocks_found}，num_colors={result.k_used}，mode={result.mode}，"
         f"device={result.device}，{result.elapsed_sec:.2f}s）"
     )
     typer.echo(f"停止原因: {result.stop_reason}")
@@ -231,7 +241,7 @@ def score_cmd(
     """对预测图打分（曲线边界 + 色彩 + line / simple / overall）。"""
     from PIL import Image
 
-    target = abstract_to_blocks(input_image, ApproxConfig())
+    target = abstract_to_blocks(input_image)
     pred = Image.open(pred_image).convert("RGBA")
     report = score_prediction(pred, target, n_layers=n_layers, pass_overall=pass_score)
     typer.echo(report.summary())

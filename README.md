@@ -1,6 +1,6 @@
 # BF Emblem Creator
 
-战地图章徽章工具：离线渲染编辑器 JSON，并按 **v2 曲线色块 + 大尺度重叠 + 线条质量 + GPU 粒子** 做自动近似。
+战地图章徽章工具：离线渲染编辑器 JSON，并按 **可见边界曲线拟合 + 共享边拓扑 + 线条质量 + GPU 粒子** 做自动近似。
 
 ## 规范
 
@@ -32,8 +32,11 @@ uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_
 # JSON → PNG
 uv run bfemblem render examples/sample_emblem.json -o out/sample.png
 
-# 图像 → 图章 JSON（v2）
+# 图像 → 图章 JSON
 uv run bfemblem approx examples/😄.png -o out/smile.json -p out/smile.png
+
+# 严格色量（可用颜色数）
+uv run bfemblem approx examples/gold.png -o out/gold.json --num-colors 6 -d out/debug
 
 # 评分（sim / line / simple / overall）
 uv run bfemblem score examples/😄.png out/smile.png --layers 2
@@ -42,12 +45,12 @@ uv run bfemblem validate examples/sample_emblem.json
 uv run bfemblem list-stamps
 ```
 
-## 近似算法（v2 摘要）
+## 近似算法（摘要）
 
-详见 [docs/algorithm-v2-curve-overlap-gpu.md](docs/algorithm-v2-curve-overlap-gpu.md)。
+详见 [docs/visible-boundary-fitting.md](docs/visible-boundary-fitting.md) 与 [docs/shared-edge-and-planar-field.md](docs/shared-edge-and-planar-field.md)。
 
-1. 少色大块概括 + 轮廓曲线  
-2. 图章边缘曲线库（可缓存）  
+1. 严格 LAB k-means 色量（`num_colors`）+ 共享边平面图  
+2. 图章边缘曲线库：并行 SVG 栅格 + 批量 GPU SDF + 外环/内孔多环；缓存缺则补算，全量重算用 `prefit-stamps`  
 3. **大尺度 / 出画布** GPU 粒子匹配，层间重叠造型  
 4. 评分：`overall ≈ sim × line × simple`，**线条硬门槛**  
 
@@ -56,7 +59,7 @@ uv run bfemblem list-stamps
 ```python
 from bf_emblem_creator import approximate_image, ApproxConfig
 
-result = approximate_image("examples/😄.png", ApproxConfig(), n_particles=256)
+result = approximate_image("examples/😄.png", ApproxConfig(num_colors=6), n_particles=256)
 print(result.score.summary())
 result.document.save_json("out/smile.json")
 ```
@@ -72,9 +75,8 @@ uv run pytest
 
 ## 文档
 
-- [v3 算法：可见边界曲线拟合](docs/algorithm-v3-visible-boundary-fitting.md)
-- [v3 补篇：通用标签场 + 共享边缘拓扑（分批设计）](docs/algorithm-v3-shared-edge-and-planar-field.md)
-- [v2 算法：曲线色块 / 重叠 / GPU](docs/algorithm-v2-curve-overlap-gpu.md)（历史）
+- [可见边界曲线拟合](docs/visible-boundary-fitting.md)
+- [通用标签场 + 共享边缘拓扑](docs/shared-edge-and-planar-field.md)
 - [技术方案](docs/technical-design.md)
 - [图像概括](docs/image-abstraction.md)
 - [编码规范](docs/coding-conventions.md)

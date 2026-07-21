@@ -1,4 +1,4 @@
-"""Batch B：通用标签场概括 — 平坦区调色板、空间正则、细丝/小洞、无洞保证。"""
+"""标签场：严格 LAB k-means 色量、空间正则、小洞合并、无洞保证。"""
 
 from __future__ import annotations
 
@@ -22,22 +22,6 @@ def image_gradient_magnitude(rgb: U8Arr) -> FloatArr:
     return np.maximum(gx, gy)
 
 
-def flat_mask(
-    rgb: U8Arr,
-    alpha: FloatArr,
-    *,
-    grad_q: float = 0.45,
-) -> BoolArr:
-    """主体内低梯度平坦区（用于估调色板）。"""
-    subject = np.asarray(alpha, dtype=np.float64) >= 0.5
-    g = image_gradient_magnitude(rgb)
-    if not subject.any():
-        return np.zeros_like(subject, dtype=bool)
-    thr = float(np.quantile(g[subject], grad_q))
-    thr = max(thr, 1.0)
-    return subject & (g <= thr)
-
-
 def kmeans_lab_points(
     pts: FloatArr,
     k: int,
@@ -45,12 +29,12 @@ def kmeans_lab_points(
     iters: int = 15,
     seed: int = 0,
 ) -> tuple[I32Arr, FloatArr]:
-    """CPU LAB k-means；返回 assign (N,) 与 centers (k,3)。"""
+    """CPU LAB k-means++；返回 assign (N,) 与 centers (k_eff,3)。"""
     p = np.asarray(pts, dtype=np.float64)
     n = int(p.shape[0])
     if n == 0:
-        return np.zeros(0, dtype=np.int32), np.zeros((k, 3), dtype=np.float64)
-    k_eff = min(k, n)
+        return np.zeros(0, dtype=np.int32), np.zeros((0, 3), dtype=np.float64)
+    k_eff = min(max(1, int(k)), n)
     rng = np.random.default_rng(seed)
     centers = np.empty((k_eff, 3), dtype=np.float64)
     centers[0] = p[int(rng.integers(0, n))]
@@ -77,65 +61,35 @@ def kmeans_lab_points(
     return assign, centers
 
 
-def estimate_palette_flat(
+def estimate_palette_strict(
     rgb: U8Arr,
     alpha: FloatArr,
-    k: int,
+    num_colors: int,
     *,
-    grad_q: float = 0.45,
-    lab_merge: float = 10.0,
     seed: int = 0,
 ) -> list[PaletteColor]:
     """
-    仅用平坦区像素估计调色板；近色合并。
+    对主体像素做严格 LAB k-means 色量。
 
-    高梯度过渡带不参与中心更新，降低杂色中心。
+    - K = num_colors（像素不足时自动降为像素数）；
+    - 不做近色/色相/阴影软合并，最终调色板长度恰好为 k_eff。
     """
     subject = np.asarray(alpha, dtype=np.float64) >= 0.5
     if not subject.any():
         return []
-    flat = flat_mask(rgb, alpha, grad_q=grad_q)
     lab = rgb_u8_to_lab(rgb)
-    # 平坦区过少则退回全体主体
-    use = flat if float(flat.sum()) >= max(32.0, 0.05 * float(subject.sum())) else subject
-    pts = lab[use]
-    k_use = max(2, min(16, int(k)))
-    _, centers = kmeans_lab_points(pts, k_use, seed=seed)
-    # 近色合并
-    parent = list(range(len(centers)))
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    for i in range(len(centers)):
-        for j in range(i + 1, len(centers)):
-            if float(np.linalg.norm(centers[i] - centers[j])) < lab_merge:
-                pi, pj = find(i), find(j)
-                if pi != pj:
-                    parent[pj] = pi
-    roots = sorted({find(i) for i in range(len(centers))})
-    merged: list[FloatArr] = []
-    for r in roots:
-        members = [i for i in range(len(centers)) if find(i) == r]
-        merged.append(np.mean([centers[i] for i in members], axis=0))
-    # 用全体主体算 fraction 排序
-    all_pts = lab[subject]
-    d = np.linalg.norm(all_pts[:, None, :] - np.stack(merged)[None, :, :], axis=2)
-    assign = np.argmin(d, axis=1)
+    pts = lab[subject]
+    k_use = max(1, min(int(num_colors), int(pts.shape[0])))
+    assign, centers = kmeans_lab_points(pts, k_use, seed=seed)
     total = float(len(assign))
     order: list[tuple[float, int, tuple[int, int, int]]] = []
-    for ci, c in enumerate(merged):
+    for ci in range(int(centers.shape[0])):
         frac = float((assign == ci).sum()) / max(total, 1.0)
-        rgb_c = lab_to_rgb_u8(np.asarray(c, dtype=np.float64)[None, None, :])[0, 0]
+        rgb_c = lab_to_rgb_u8(np.asarray(centers[ci], dtype=np.float64)[None, None, :])[0, 0]
         order.append((frac, ci, (int(rgb_c[0]), int(rgb_c[1]), int(rgb_c[2]))))
+    # 按面积降序，但保留全部 K 个中心（严格色数）
     order.sort(key=lambda t: -t[0])
-    palette: list[PaletteColor] = []
-    for frac, _, rgb_c in order:
-        palette.append(PaletteColor(hex=rgb_to_hex(rgb_c), fraction=frac, rgb=rgb_c))
-    return palette
+    return [PaletteColor(hex=rgb_to_hex(rgb_c), fraction=frac, rgb=rgb_c) for frac, _, rgb_c in order]
 
 
 def assign_labels_hard(
@@ -184,7 +138,6 @@ def icm_label_refine(
     h, w = out.shape
     k = len(palette)
     ys, xs = np.where(subject)
-    # 数据项预计算
     data = np.full((h, w, k), 1e6, dtype=np.float64)
     pts = lab[subject]
     d = np.linalg.norm(pts[:, None, :] - centers[None, :, :], axis=2)
@@ -193,7 +146,6 @@ def icm_label_refine(
     neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
     for _ in range(iters):
         changed = 0
-        # 扫描顺序交替
         order = np.arange(len(ys))
         for idx in order:
             y, x = int(ys[idx]), int(xs[idx])
@@ -208,7 +160,6 @@ def icm_label_refine(
                     if not subject[ny, nx]:
                         continue
                     if int(out[ny, nx]) != cand:
-                        # 梯度大 → 切换代价低
                         w_edge = mrf_lambda * (1.0 / (1.0 + 2.5 * float(g_n[y, x])))
                         e += w_edge
                 if e < best_e:
@@ -264,7 +215,6 @@ def _neighbor_majority_label(labels: I32Arr, region: BoolArr, forbid: int) -> in
                 if v >= 0 and v != forbid and not region[ny, nx]:
                     counts[v] += 1
     if not counts:
-        # 退回全局最大面积标签
         vals, cnt = np.unique(labels[labels >= 0], return_counts=True)
         if len(vals) == 0:
             return max(forbid, 0)
@@ -303,7 +253,6 @@ def fill_label_gaps(
     h, w = out.shape
     from collections import deque
 
-    # 多轮邻域填充
     for _ in range(64):
         gap = subject & (out < 0)
         if not gap.any():
@@ -322,7 +271,6 @@ def fill_label_gaps(
                 changed = True
         if changed:
             continue
-        # BFS 最近标签
         dist = np.full((h, w), -1, dtype=np.int32)
         src = np.full((h, w), -1, dtype=np.int32)
         q: deque[tuple[int, int]] = deque()
@@ -356,12 +304,11 @@ def compact_palette_labels(
     palette: list[PaletteColor],
     alpha: FloatArr,
 ) -> tuple[I32Arr, list[PaletteColor]]:
-    """压缩未使用标签并按面积重排。"""
+    """压缩未使用标签并按面积重排（空簇剔除后可能少于请求 K）。"""
     subject = np.asarray(alpha, dtype=np.float64) >= 0.5
     used = sorted({int(v) for v in np.unique(labels) if int(v) >= 0})
     if not used:
         return labels, []
-    # 按面积排序
     areas = [(float((labels == u).sum()), u) for u in used]
     areas.sort(key=lambda t: -t[0])
     remap = {old: new for new, (_, old) in enumerate(areas)}
@@ -386,7 +333,7 @@ def gap_fraction(labels: I32Arr, alpha: FloatArr) -> float:
 
 
 def noise_fraction(labels: I32Arr, alpha: FloatArr, *, min_area: float) -> float:
-    """面积 < min_area 的连通域像素占主体比例。"""
+    """过小连通域像素占比。"""
     subject = np.asarray(alpha, dtype=np.float64) >= 0.5
     if not subject.any():
         return 0.0
@@ -394,6 +341,8 @@ def noise_fraction(labels: I32Arr, alpha: FloatArr, *, min_area: float) -> float
     max_lab = int(labels.max()) if labels.size and labels.max() >= 0 else -1
     for lab in range(max_lab + 1):
         base = (labels == lab) & subject
+        if not base.any():
+            continue
         for cc in _label_ccs(base):
             a = float(cc.sum())
             if a < min_area:
@@ -404,24 +353,28 @@ def noise_fraction(labels: I32Arr, alpha: FloatArr, *, min_area: float) -> float
 def build_label_field(
     rgb: U8Arr,
     alpha: FloatArr,
-    k: int,
+    num_colors: int,
     *,
-    grad_q: float = 0.45,
-    lab_merge: float = 10.0,
-    mrf_lambda: float = 2.0,
+    mrf_lambda: float = 2.5,
     mrf_iters: int = 5,
     min_area_frac: float = 0.004,
     enforce_no_gap: bool = True,
     seed: int = 0,
 ) -> tuple[I32Arr, list[PaletteColor], float, float]:
     """
-    完整 Batch B：调色板 → 硬分配 → ICM → 小域合并 → 无洞。
+    严格色量标签场：
+
+    1. 主体 LAB k-means（K=num_colors）
+    2. 硬分配
+    3. ICM 空间正则
+    4. 过小连通域并邻域
+    5. 主体无洞
 
     返回 labels, palette, gap_frac, noise_frac。
     """
     h, w = alpha.shape
     min_area = max(1.0, min_area_frac * h * w)
-    palette = estimate_palette_flat(rgb, alpha, k, grad_q=grad_q, lab_merge=lab_merge, seed=seed)
+    palette = estimate_palette_strict(rgb, alpha, num_colors, seed=seed)
     if not palette:
         labels = np.full((h, w), -1, dtype=np.int32)
         return labels, [], 0.0, 0.0

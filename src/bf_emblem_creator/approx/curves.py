@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from bf_emblem_creator.approx.device import get_device
 from bf_emblem_creator.approx.gpu_ops import (
     curvature_descriptor_torch,
+    foreground_cc_masks,
+    interior_hole_masks,
     mask_to_sdf_fast,
     rdp_torch,
     resample_closed_contour_torch,
@@ -151,7 +153,7 @@ def _moore_trace(
 def extract_all_contours(
     mask: BoolArr,
     *,
-    simplify: float = 0.6,
+    simplify: float = 0.0,
     min_points: int = 8,
     min_area: float = 4.0,
     max_rings: int = 32,
@@ -159,9 +161,8 @@ def extract_all_contours(
     """
     提取全部闭合轮廓：外轮廓 + 内部孔洞。
 
-    - 使用 Moore 边界跟踪（忠实于掩膜拓扑，非极角排序）
-    - 有向面积：|area| 最大且为正的记 outer，其余负面积记 hole
-    - 多连通部件各自有外轮廓
+    - Moore 边界跟踪（忠实于掩膜拓扑）
+    - 默认 simplify=0（不做 RDP）；仅当显式传入 >0 时降采样
     """
     m = np.asarray(mask, dtype=bool)
     if not m.any():
@@ -252,11 +253,11 @@ def _point_in_poly(x: float, y: float, poly: FloatArr) -> bool:
     return inside
 
 
-def extract_outer_contour(mask: BoolArr, *, simplify: float = 0.6) -> FloatArr | None:
+def extract_outer_contour(mask: BoolArr, *, simplify: float = 0.0) -> FloatArr | None:
     """
     提取主外轮廓（面积最大 outer）。
 
-    兼容旧 API；内部孔请用 extract_all_contours。
+    主外轮廓；内部孔请用 extract_all_contours。
     """
     rings = extract_all_contours(mask, simplify=simplify)
     if not rings:
@@ -270,7 +271,7 @@ def extract_outer_contour(mask: BoolArr, *, simplify: float = 0.6) -> FloatArr |
 def extract_contour_bundle(
     mask: BoolArr,
     *,
-    simplify: float = 0.6,
+    simplify: float = 0.0,
     resample_n: int = 128,
 ) -> tuple[FloatArr, list[FloatArr], FloatArr]:
     """
@@ -564,131 +565,195 @@ def fit_ellipse_to_mask(mask: BoolArr, *, n: int = 160) -> tuple[FloatArr, float
     return poly, float(err)
 
 
+def fit_mask_contour_high_precision(
+    mask: BoolArr,
+    *,
+    max_area_rel_err: float = 0.03,
+    resample_n: int = 256,
+    use_cc_holes: bool = True,
+) -> tuple[FloatArr, list[FloatArr], FloatArr, float]:
+    """
+    高精度闭合轮廓（与概括色块同一路线，**禁止折线/直线概括**）。
+
+    策略：
+    1. Moore 密轮廓（`simplify=0`，不做 RDP）+ 可选 GPU 内洞 CC 补全；
+    2. 外环 + 孔洞分别弧长密重采样；
+    3. 绕质心微调外环/孔，使栅格面积相对 mask 误差 ≤ 阈值；
+    4. **不**用 line / polyline 替换几何。
+
+    返回 (outer_dense, holes_dense, outer_resampled, area_rel_err)。
+    holes_dense 含内孔；多部件时其余外环也并入 holes 侧（与 extract_contour_bundle 一致，供 all_rings）。
+    """
+    m = np.asarray(mask, dtype=bool)
+    mask_a = float(m.sum())
+    empty = np.zeros((0, 2), dtype=np.float64)
+    if mask_a < 1.0:
+        return empty, [], empty, 0.0
+
+    rings = extract_all_contours(m, simplify=0.0, min_points=6, min_area=1.0)
+    outer: FloatArr | None = None
+    holes: list[FloatArr] = []
+    if rings:
+        outers = [r.numpy() for r in rings if r.kind == "outer"]
+        holes = [_ensure_closed(r.numpy()) for r in rings if r.kind == "hole"]
+        pool = outers if outers else [r.numpy() for r in rings]
+        outer_idx = int(np.argmax([polygon_area(p) for p in pool]))
+        outer = _ensure_closed(pool[outer_idx])
+        # 其余 outer 并入附加环（多部件）；勿用 `is` 比较数组
+        for i, p in enumerate(pool):
+            if i == outer_idx:
+                continue
+            if polygon_area(p) > 4.0:
+                holes.append(_ensure_closed(p))
+    if outer is None or len(outer) < 4:
+        ys, xs = np.where(m)
+        x0, x1 = float(xs.min()), float(xs.max()) + 1.0
+        y0, y1 = float(ys.min()), float(ys.max()) + 1.0
+        outer = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=np.float64)
+
+    if use_cc_holes:
+        holes = _merge_cc_holes_and_extra_outers(m, outer, holes)
+
+    # 丢弃相对主外环过小的噪声孔（抗锯齿/阈值噪声）
+    outer_a = max(polygon_area(outer), 1.0)
+    holes = [h for h in holes if polygon_area(h) >= max(8.0, 0.004 * outer_a)]
+
+    # 孔洞也做弧长密采样（保持曲线精度，非折线化）
+    n_outer = max(int(resample_n), 64)
+    outer_rs = resample_closed_contour(outer, n_outer)
+    holes_rs: list[FloatArr] = []
+    for h in holes:
+        if len(h) < 4:
+            continue
+        n_h = max(48, min(n_outer, max(32, int(len(h) * 1.5))))
+        holes_rs.append(resample_closed_contour(h, n_h))
+
+    adj_o, adj_h, err = adjust_contour_area_to_mask(
+        outer_rs,
+        m,
+        holes_rs if holes_rs else None,
+        max_area_rel_err=max_area_rel_err,
+    )
+    # 微调后再次弧长均匀，保证匹配/描述子采样稳定
+    outer_final = resample_closed_contour(adj_o, n_outer)
+    holes_final = [resample_closed_contour(h, max(48, min(n_outer, len(h)))) for h in adj_h if len(h) >= 4]
+    return outer_final, holes_final, outer_final, float(err)
+
+
+def _orient_ring(pts: FloatArr, *, hole: bool) -> FloatArr:
+    """outer 取 CCW（正面积），hole 取 CW（负面积）。"""
+    p = _ensure_closed(pts)
+    a = signed_area(p)
+    if hole and a > 0:
+        return p[::-1].copy()
+    if (not hole) and a < 0:
+        return p[::-1].copy()
+    return p
+
+
+def _ring_centroid(pts: FloatArr) -> tuple[float, float]:
+    p = np.asarray(pts, dtype=np.float64)
+    return float(p[:, 0].mean()), float(p[:, 1].mean())
+
+
+def _rings_near_duplicate(a: FloatArr, b: FloatArr, *, dist_thr: float = 3.0) -> bool:
+    """质心距 + 面积比粗判重复环。"""
+    ca = _ring_centroid(a)
+    cb = _ring_centroid(b)
+    if math.hypot(ca[0] - cb[0], ca[1] - cb[1]) > dist_thr:
+        return False
+    aa, ab = polygon_area(a), polygon_area(b)
+    if aa < 1e-6 or ab < 1e-6:
+        return True
+    ratio = min(aa, ab) / max(aa, ab)
+    return ratio >= 0.7
+
+
+def _contour_from_binary_component(comp: BoolArr, *, hole: bool, min_points: int = 6) -> FloatArr | None:
+    """对单连通 bool 分量提取闭合轮廓并定向。"""
+    if not comp.any():
+        return None
+    rings = extract_all_contours(comp, simplify=0.0, min_points=min_points, min_area=1.0)
+    if not rings:
+        return None
+    # 分量上最大环
+    best = max(rings, key=lambda r: polygon_area(r.numpy()))
+    return _orient_ring(best.numpy(), hole=hole)
+
+
+def _merge_cc_holes_and_extra_outers(
+    mask: BoolArr,
+    outer: FloatArr,
+    holes: list[FloatArr],
+) -> list[FloatArr]:
+    """
+    用 GPU 内洞 CC + 多部件前景 CC 补全/去重 holes 列表。
+
+    - 内洞：~mask 连通域中不触边者 → hole 轮廓
+    - 附加外环：其余大前景 CC（非主外环覆盖）→ 并入 holes 侧 all_rings
+    """
+    m = np.asarray(mask, dtype=bool)
+    out: list[FloatArr] = list(holes)
+    # 1) 内洞 CC
+    try:
+        hole_ms = interior_hole_masks(m, min_area=4.0, max_holes=32)
+    except Exception:
+        hole_ms = []
+    for hm in hole_ms:
+        cont = _contour_from_binary_component(hm, hole=True)
+        if cont is None or len(cont) < 4:
+            continue
+        if any(_rings_near_duplicate(cont, h) for h in out):
+            continue
+        out.append(cont)
+    # 2) 多部件前景：仅保留相对主部件足够大的次级块（避免抗锯齿碎斑）
+    try:
+        parts = foreground_cc_masks(m, min_area=max(64.0, float(m.sum()) * 0.05), max_parts=8)
+    except Exception:
+        parts = []
+    if len(parts) > 1:
+        # 主部件：与 outer 质心最近且面积最大优先
+        ocx, ocy = _ring_centroid(outer)
+        scored = []
+        for pmask in parts:
+            ys, xs = np.where(pmask)
+            if len(xs) == 0:
+                continue
+            cx, cy = float(xs.mean()), float(ys.mean())
+            scored.append((int(pmask.sum()), math.hypot(cx - ocx, cy - ocy), pmask))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        main_area = max(scored[0][0], 1)
+        for area, _d, pmask in scored[1:]:
+            # 次级部件至少主部件 12% 才记为附加外环
+            if area < 0.12 * main_area:
+                continue
+            cont = _contour_from_binary_component(pmask, hole=False)
+            if cont is None or len(cont) < 4:
+                continue
+            # 不与主 outer 重复
+            if _rings_near_duplicate(cont, outer, dist_thr=4.0):
+                continue
+            if any(_rings_near_duplicate(cont, h) for h in out):
+                continue
+            out.append(cont)
+    return out
+
+
 def fit_mask_contour_area_constrained(
     mask: BoolArr,
     *,
     max_area_rel_err: float = 0.03,
-    min_eps: float = 0.05,
-    max_eps: float = 2.0,
     resample_n: int = 192,
 ) -> tuple[FloatArr, FloatArr, float]:
     """
-    闭合色块轮廓拟合：拟合面积相对 mask 像素面积误差 ≤ max_area_rel_err（默认 3%）。
+    闭合色块轮廓：Moore 密跟踪 + 面积微调 + 弧长重采样。
 
-    策略：
-    1. Moore 密轮廓（不预 RDP）；有孔时面积 = outer−holes；
-    2. 高圆度/高填充尝试圆、椭圆参数曲线（面积可精确贴合）；
-    3. 否则对密外轮廓自适应 RDP：在面积误差约束下取尽可能大的 eps；
-    4. 仍不满足则回退密轮廓。
-
+    **唯一路径**；不做 RDP / 直线折线概括。
     返回 (contour, contour_resampled, area_rel_err)。
     """
-    m = np.asarray(mask, dtype=bool)
-    mask_a = float(m.sum())
-    if mask_a < 1.0:
-        empty = np.zeros((0, 2), dtype=np.float64)
-        return empty, empty, 0.0
-
-    # 密轮廓
-    rings = extract_all_contours(m, simplify=0.0, min_points=6, min_area=1.0)
-    dense: FloatArr | None = None
-    holes_dense: list[FloatArr] = []
-    if rings:
-        outers = [r.numpy() for r in rings if r.kind == "outer"]
-        holes_dense = [_ensure_closed(r.numpy()) for r in rings if r.kind == "hole"]
-        pool = outers if outers else [r.numpy() for r in rings]
-        dense = max(pool, key=polygon_area)
-        dense = _ensure_closed(dense)
-
-    def _area_err(poly: FloatArr) -> float:
-        """相对 mask 像素面积的相对误差。"""
-        a = fitted_region_area(poly, holes_dense if holes_dense else None, mask_shape=m.shape)
-        return area_relative_error(a, mask_a)
-
-    # 圆度粗估（按外轮廓周长 vs 外轮廓填充面积，避免孔洞干扰）
-    peri = 1.0
-    if dense is not None and len(dense) >= 3:
-        peri = float(np.linalg.norm(np.diff(dense, axis=0), axis=1).sum()) + 1e-6
-    outer_fill = polygon_area(dense) if dense is not None else mask_a
-    circ = float(np.clip(4.0 * math.pi * outer_fill / (peri * peri), 0.0, 2.0)) if dense is not None else 0.0
-    ys, xs = np.where(m)
-    bw = float(max(1, int(xs.max()) - int(xs.min()) + 1))
-    bh = float(max(1, int(ys.max()) - int(ys.min()) + 1))
-    fill = float(np.clip(mask_a / max(bw * bh, 1.0), 0.0, 1.0))
-    solid_like = len(holes_dense) == 0 and fill >= 0.45
-
-    candidates: list[tuple[FloatArr, float]] = []
-
-    if solid_like and circ >= 0.72 and fill >= 0.55:
-        cfit = fit_circle_to_mask(m, n=max(96, resample_n))
-        if cfit is not None:
-            candidates.append(cfit)
-    if solid_like and circ >= 0.45 and fill >= 0.45:
-        efit = fit_ellipse_to_mask(m, n=max(96, resample_n))
-        if efit is not None:
-            candidates.append(efit)
-
-    if dense is not None and len(dense) >= 4:
-        # 自适应 RDP：在面积约束下最大化 eps
-        lo, hi = min_eps, max_eps
-        best_poly = dense
-        best_err = _area_err(dense)
-        for _ in range(14):
-            mid = 0.5 * (lo + hi)
-            simp = _ensure_closed(rdp(dense, mid))
-            if len(simp) < 4:
-                hi = mid
-                continue
-            err = _area_err(simp)
-            if err <= max_area_rel_err:
-                best_poly = simp
-                best_err = err
-                lo = mid
-            else:
-                hi = mid
-        if best_err > max_area_rel_err:
-            for eps in np.geomspace(max(min_eps, 0.05), max(min_eps * 0.5, 0.02), 8):
-                simp = _ensure_closed(rdp(dense, float(eps)))
-                if len(simp) < 4:
-                    continue
-                err = _area_err(simp)
-                if err <= max_area_rel_err:
-                    best_poly = simp
-                    best_err = err
-                    break
-            else:
-                best_poly = dense
-                best_err = _area_err(dense)
-        candidates.append((best_poly, best_err))
-
-    if not candidates:
-        x0, x1 = float(xs.min()), float(xs.max()) + 1.0
-        y0, y1 = float(ys.min()), float(ys.max()) + 1.0
-        box = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=np.float64)
-        err = _area_err(box)
-        rs = resample_closed_contour(box, resample_n)
-        return box, rs, err
-
-    def _rank(item: tuple[FloatArr, float]) -> tuple[float, float]:
-        poly, err = item
-        iou = _mask_fill_iou(m, poly, m.shape) if not holes_dense else max(0.0, 1.0 - err)
-        ok = 1.0 if err <= max_area_rel_err else 0.0
-        return (ok, iou - 0.1 * err)
-
-    best_poly, best_err = max(candidates, key=_rank)
-    best_poly = _ensure_closed(best_poly)
-    if best_err > max_area_rel_err and dense is not None:
-        best_poly = dense
-        best_err = _area_err(dense)
-    # 面积微调：半像素 Moore 偏差通过质心缩放压到 ≤ 阈值
-    adj_o, _, adj_err = adjust_contour_area_to_mask(
-        best_poly,
-        m,
-        holes_dense if holes_dense else None,
+    outer, _holes, rs, err = fit_mask_contour_high_precision(
+        mask,
         max_area_rel_err=max_area_rel_err,
+        resample_n=resample_n,
     )
-    if adj_err <= best_err + 1e-9:
-        best_poly = adj_o
-        best_err = adj_err
-    rs = resample_closed_contour(best_poly, resample_n)
-    return best_poly, rs, float(best_err)
+    return outer, rs, err

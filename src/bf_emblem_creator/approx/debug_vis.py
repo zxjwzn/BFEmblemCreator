@@ -208,8 +208,18 @@ class DebugVisualizer:
         draw2 = ImageDraw.Draw(img2)
         for i, reg in enumerate(items):
             color = _PALETTE[i % len(_PALETTE)]
-            pts = reg.contour_resampled if reg.contour_resampled is not None else reg.contour
-            if pts is not None and len(np.asarray(pts)) >= 2:
+            # 调试：优先较疏采样，避免满屏密折线
+            raw = reg.contour if reg.contour is not None else reg.contour_resampled
+            pts = None
+            if raw is not None:
+                arr = np.asarray(raw, dtype=np.float64)
+                if len(arr) >= 2:
+                    if len(arr) > 96:
+                        idx = np.linspace(0, len(arr) - 1, 64).astype(int)
+                        pts = arr[idx]
+                    else:
+                        pts = arr
+            if pts is not None and len(pts) >= 2:
                 _draw_polyline(draw2, pts, color, width=2, closed=True)
             cx, cy = reg.centroid
             err = reg.contour_area_rel_err
@@ -254,6 +264,48 @@ class DebugVisualizer:
             return
         img.save(path)
         self.saved.append(path)
+
+    def save_edge_polylines(
+        self,
+        base_rgb: NDArray[np.generic] | U8Arr,
+        edges: Sequence[tuple[int, NDArray[np.floating], bool]],
+        *,
+        name: str,
+        width: int = 2,
+    ) -> Path | None:
+        """
+        绘制共享边折线集合。
+
+        edges: [(edge_id, polyline Nx2, closed), ...]
+        用于对比贝塞尔拟合前 dense 与拟合后几何。
+        """
+        base = _as_rgb_u8(base_rgb)
+        img = Image.fromarray(base.copy(), mode="RGB")
+        draw = ImageDraw.Draw(img)
+        for i, (_eid, poly, closed) in enumerate(edges):
+            color = _PALETTE[i % len(_PALETTE)]
+            pts = np.asarray(poly, dtype=np.float64)
+            if len(pts) < 2:
+                continue
+            _draw_polyline(draw, pts, color, width=width, closed=bool(closed))
+        path = self._next_path(name)
+        if path is None:
+            return None
+        img.save(path)
+        self.saved.append(path)
+        return path
+
+    def save_curve_fit_compare(
+        self,
+        base_rgb: NDArray[np.generic] | U8Arr,
+        *,
+        before_edges: Sequence[tuple[int, NDArray[np.floating], bool]],
+        after_edges: Sequence[tuple[int, NDArray[np.floating], bool]],
+    ) -> None:
+        """贝塞尔拟合前 dense 边界 + 拟合后边界（两张图）。"""
+        # 同线宽便于对比；拟合后应用更疏的几何
+        self.save_edge_polylines(base_rgb, before_edges, name="01c_edges_dense_before_fit", width=1)
+        self.save_edge_polylines(base_rgb, after_edges, name="01d_edges_bezier_after_fit", width=1)
 
     def save_contours(self, base_rgb: NDArray[np.generic] | U8Arr, regions: Iterable[Region]) -> None:
         """区域外轮廓（密重采样为主，叠加拟合多边形）。"""
@@ -309,13 +361,14 @@ class DebugVisualizer:
         base_rgb: NDArray[np.generic] | U8Arr,
         region: Region,
         layer: StampLayer,
-        stamp_curve_canvas: FloatArr | None,
+        stamp_curve_canvas: FloatArr | Sequence[FloatArr] | None,
         layer_index: int,
         score_hint: float | None = None,
     ) -> None:
         """
-        仅输出**已接受**的匹配：区域轮廓（绿）+ 变换后图章曲线（品红）+ 层摘要。
+        仅输出**已接受**的匹配：区域轮廓（绿）+ 图章曲线含孔（品红）+ 层摘要。
 
+        ``stamp_curve_canvas`` 可为单条折线，或外环+内孔的多环列表。
         粒子搜索过程不写盘。
         """
         base = _as_rgb_u8(base_rgb)
@@ -323,8 +376,9 @@ class DebugVisualizer:
         draw = ImageDraw.Draw(img)
         if region.contour is not None:
             _draw_polyline(draw, region.contour, (40, 220, 80), width=2, closed=True)
-        if stamp_curve_canvas is not None and len(stamp_curve_canvas) >= 2:
-            _draw_polyline(draw, stamp_curve_canvas, (240, 40, 200), width=2, closed=True)
+        for ring in _as_curve_rings(stamp_curve_canvas):
+            # 外轮廓与内孔同色（品红）
+            _draw_polyline(draw, ring, (240, 40, 200), width=2, closed=True)
         asset = layer.asset
         rid = region.region_id
         left = float(layer.left)
@@ -419,3 +473,46 @@ def stamp_layer_curve_on_canvas(
     xr = c * x + s * y
     yr = -s * x + c * y
     return np.stack([xr + left, yr + top], axis=1)
+
+
+def stamp_layer_rings_on_canvas(
+    local_rings: Sequence[FloatArr],
+    *,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    angle_deg: float,
+) -> list[FloatArr]:
+    """将多环（外轮廓 + 内孔）变换到画布坐标，跳过过短环。"""
+    out: list[FloatArr] = []
+    for ring in local_rings:
+        pts = stamp_layer_curve_on_canvas(
+            np.asarray(ring, dtype=np.float64),
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+            angle_deg=angle_deg,
+        )
+        if len(pts) >= 2:
+            out.append(pts)
+    return out
+
+
+def _as_curve_rings(curves: FloatArr | Sequence[FloatArr] | None) -> list[FloatArr]:
+    """将单环或环列表规范为有效折线列表。"""
+    if curves is None:
+        return []
+    # 单条 (N,2) ndarray
+    if isinstance(curves, np.ndarray):
+        arr = np.asarray(curves, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] >= 2:
+            return [arr]
+        return []
+    rings: list[FloatArr] = []
+    for item in curves:
+        arr = np.asarray(item, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] >= 2:
+            rings.append(arr)
+    return rings

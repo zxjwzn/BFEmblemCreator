@@ -1,24 +1,22 @@
-"""P1：色彩平面化（Batch A 重采样 + Batch B 标签场）。"""
+"""色彩平面化：ImageProcessorConfig 驱动的严格 LAB 色量。"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
-import torch
 from numpy.typing import NDArray
 from PIL import Image
 
-from bf_emblem_creator.approx.device import get_device
 from bf_emblem_creator.approx.label_field import build_label_field, labels_to_rgb
-from bf_emblem_creator.approx.models import AbstractionMode, ApproxConfig, ApproxMeta, PaletteColor
+from bf_emblem_creator.approx.models import AbstractionMode, ApproxMeta, PaletteColor
 from bf_emblem_creator.approx.preprocess import (
     bilateral_smooth,
-    detect_mode,
     detect_resample_mode,
     estimate_alpha,
     fit_to_canvas,
 )
+from bf_emblem_creator.approx.recipe import BilateralStrength, FitPolicy, ImageProcessorConfig
 
 U8Arr = NDArray[np.uint8]
 FloatArr = NDArray[np.floating]
@@ -39,110 +37,62 @@ def _load_rgba(image: Image.Image | str | Path | U8Arr) -> Image.Image:
     return Image.fromarray(arr.astype(np.uint8), mode="RGBA")
 
 
-def kmeans_lab_torch(
-    lab_pts: torch.Tensor,
-    k: int,
-    *,
-    iters: int = 15,
-    seed: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    GPU/CPU LAB k-means（兼容旧接口）。
-
-    lab_pts: (N,3)；返回 assign (N,) int64、centers (k,3)。
-    """
-    n = int(lab_pts.shape[0])
-    if n == 0:
-        return (
-            torch.zeros(0, dtype=torch.long, device=lab_pts.device),
-            torch.zeros((k, 3), dtype=lab_pts.dtype, device=lab_pts.device),
-        )
-    k_eff = min(k, n)
-    g = torch.Generator(device=lab_pts.device)
-    g.manual_seed(int(seed))
-    idx0 = int(torch.randint(0, n, (1,), generator=g, device=lab_pts.device).item())
-    centers = lab_pts[idx0 : idx0 + 1]
-    closest = torch.full((n,), float("inf"), device=lab_pts.device, dtype=lab_pts.dtype)
-    for _ in range(1, k_eff):
-        d = torch.cdist(lab_pts, centers[-1:]).squeeze(1)
-        closest = torch.minimum(closest, d)
-        probs = closest.clamp_min(0.0) ** 2
-        s = float(probs.sum().item())
-        if s < 1e-12:
-            j = int(torch.randint(0, n, (1,), generator=g, device=lab_pts.device).item())
-        else:
-            j = int(torch.multinomial(probs, 1, generator=g).item())
-        centers = torch.cat([centers, lab_pts[j : j + 1]], dim=0)
-    assign = torch.zeros(n, dtype=torch.long, device=lab_pts.device)
-    for _ in range(iters):
-        d = torch.cdist(lab_pts, centers)
-        assign = torch.argmin(d, dim=1)
-        new_centers = centers.clone()
-        for ci in range(k_eff):
-            sel = assign == ci
-            if bool(sel.any().item()):
-                new_centers[ci] = lab_pts[sel].mean(dim=0)
-            else:
-                j = int(torch.randint(0, n, (1,), generator=g, device=lab_pts.device).item())
-                new_centers[ci] = lab_pts[j]
-        centers = new_centers
-    return assign, centers
-
-
 def planarize_image(
     image: Image.Image | str | Path | U8Arr,
-    config: ApproxConfig | None = None,
+    config: ImageProcessorConfig,
     *,
-    k: int | None = None,
-    device: torch.device | None = None,
+    mode: AbstractionMode,
 ) -> tuple[I32Arr, list[PaletteColor], FloatArr, U8Arr, ApproxMeta, U8Arr]:
     """
-    色彩平面化（Batch A + B）。
+    色彩平面化：严格按 config.num_colors 做 LAB k-means。
 
     返回 labels、palette、alpha、image_q、meta、src_rgb（平滑后、量化前）。
     """
-    cfg = config or ApproxConfig()
-    _ = device or get_device(prefer_cuda=cfg.use_cuda)
+    k = max(2, min(64, int(config.num_colors)))
     rgba_img = _load_rgba(image)
-    mode = detect_mode(rgba_img) if cfg.mode == AbstractionMode.auto else cfg.mode
-    fit = "cover" if mode.value.startswith("photo") else "contain"
-    r_mode, _stats = detect_resample_mode(rgba_img, target_size=cfg.canvas_size, configured=cfg.resample_mode)
-    rgba, meta = fit_to_canvas(rgba_img, cfg.canvas_size, how=fit, resample=r_mode)
-    meta = meta.model_copy(update={"mode": mode})
+    fit = "cover" if config.fit_policy == FitPolicy.cover else "contain"
+    if mode.value.startswith("photo") and config.fit_policy == FitPolicy.contain:
+        # 配方应已设 cover；此处仍尊重 config.fit_policy
+        pass
+    r_mode, _stats = detect_resample_mode(rgba_img, target_size=config.canvas_size, configured=config.resample_mode)
+    rgba, meta = fit_to_canvas(rgba_img, config.canvas_size, how=fit, resample=r_mode)
+    meta = meta.model_copy(update={"mode": mode, "num_colors": k})
     alpha = estimate_alpha(rgba, mode)
     rgb = rgba[:, :, :3]
+    alpha_f = alpha.astype(np.float64)
+    h, w = alpha_f.shape
+    mask = alpha_f >= 0.5
 
     hard_edge = meta.resample == "nearest" and meta.approx_color_count <= 48
-    if hard_edge:
+    bil_off = (not config.bilateral) or config.bilateral_strength == BilateralStrength.off
+    if mode == AbstractionMode.pixel or hard_edge or bil_off:
         src_rgb = rgb.copy()
-    elif cfg.bilateral and mode != AbstractionMode.logo:
-        strength = "strong" if mode.value.startswith("photo") else "medium"
-        src_rgb = bilateral_smooth(rgb, strength=strength)
-    elif mode == AbstractionMode.logo:
-        src_rgb = bilateral_smooth(rgb, strength="weak")
     else:
-        src_rgb = rgb.copy()
+        strength = config.bilateral_strength.value
+        if strength not in {"weak", "medium", "strong"}:
+            strength = "medium"
+        src_rgb = bilateral_smooth(rgb, strength=strength)
 
-    k_use = int(k if k is not None else cfg.palette_k)
-    k_use = max(2, min(16, k_use))
-    mask = alpha >= 0.5
-    h, w = alpha.shape
     if not mask.any():
         labels = np.full((h, w), -1, dtype=np.int32)
-        return labels, [], alpha.astype(np.float64), np.zeros((h, w, 3), dtype=np.uint8), meta, src_rgb
+        return labels, [], alpha_f, np.zeros((h, w, 3), dtype=np.uint8), meta, src_rgb
 
     labels, palette, gap_frac, noise_frac = build_label_field(
         src_rgb,
-        alpha.astype(np.float64),
-        k_use,
-        grad_q=cfg.flat_grad_q,
-        lab_merge=cfg.lab_merge,
-        mrf_lambda=cfg.mrf_lambda,
-        mrf_iters=cfg.mrf_iters,
-        min_area_frac=cfg.min_region_area_frac,
-        enforce_no_gap=cfg.enforce_no_gap,
-        seed=cfg.seed,
+        alpha_f,
+        k,
+        mrf_lambda=config.mrf_lambda,
+        mrf_iters=config.mrf_iters,
+        min_area_frac=config.min_region_area_frac,
+        enforce_no_gap=config.enforce_no_gap,
+        seed=config.seed,
     )
-    meta = meta.model_copy(update={"gap_frac": float(gap_frac), "noise_frac": float(noise_frac)})
+    meta = meta.model_copy(
+        update={
+            "gap_frac": float(gap_frac),
+            "noise_frac": float(noise_frac),
+            "num_colors": len(palette) if palette else k,
+        }
+    )
     image_q = labels_to_rgb(labels, palette)
-    return labels, palette, alpha.astype(np.float64), image_q, meta, src_rgb
+    return labels, palette, alpha_f, image_q, meta, src_rgb

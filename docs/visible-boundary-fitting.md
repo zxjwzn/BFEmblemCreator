@@ -1,8 +1,7 @@
-# 算法 v3：可见边界曲线拟合 + 图层栈重建
+# 算法：可见边界曲线拟合 + 图层栈重建
 
-> 状态：设计稿 v0.5（**主路径已落地**；取代 v2「圆/方/长条形状路由 + 色块贴章」）  
-> 相关：[`algorithm-v2-curve-overlap-gpu.md`](./algorithm-v2-curve-overlap-gpu.md)（v2 历史；形状路由已废弃）  
-> 补篇：[`algorithm-v3-shared-edge-and-planar-field.md`](./algorithm-v3-shared-edge-and-planar-field.md)（**设计中**：通用标签场概括 + 共享边缘拓扑，分批 A–E；治软边杂色与拼合细缝）  
+> 状态：**主路径已落地**  
+> 补篇：[`shared-edge-and-planar-field.md`](./shared-edge-and-planar-field.md)（通用标签场概括 + 共享边缘拓扑；治软边杂色与拼合细缝）  
 > 约束：画布默认 320×320；图章库 256；层数 ≤40；变换含放大/旋转/平移/**出画布**；输出 `EmblemDocument` JSON + 渲染预览  
 > CLI：`bfemblem approx` / `bfemblem prefit-stamps` / `bfemblem score`
 ---
@@ -34,6 +33,9 @@
 > **前景盖住背景** 的有序色层。  
 > 你在画布上看到的每一段轮廓，都是「某一层图章边缘」在未被更上层遮挡处的 **可见弧**。  
 > 因此匹配对象是 **曲线（可见边界）**，不是整块 mask 的 IoU 唯一目标。
+
+**同色并集（关键）**：游戏里相同 `fill` 的多枚图章交叠摆放时，可见色块形状是它们 alpha 的 **并集**，不是「一色块必须对应一枚图章」。  
+因此允许（并鼓励）对复杂色区用 **2～N 枚同色图章** 拼出目标 mask；层预算内优先「覆盖残差」而非「强行单章硬套」。
 
 ---
 
@@ -90,11 +92,31 @@ T^\star = \arg\min_T \;
 
 | 级别 | 内容 | 作用 |
 |------|------|------|
-| **A. 解析基元层**（中间表示） | 每段用圆/椭圆/直线弧参数化 | 稳定、可优化、可解释层序 |
-| **B. 图章实例层**（最终输出） | 每个基元或基元组由 **一个真实图章 + \(T\)** 实现 | 满足游戏只能放库内图章 |
+| **A. 解析基元层**（中间表示） | 每段用圆/椭圆弧参数化（高精度路径禁止直线概括） | 稳定、可优化、可解释层序 |
+| **B. 图章实例层**（最终输出） | 基元或残差块由 **一枚或多枚真实图章 + \(T\)** 实现 | 满足游戏只能放库内图章 |
 
 并非每个圆弧都必须单独占一层：  
 若某图章边缘本身含多段曲率，**一次 \(T\)** 可同时贴合多段目标弧（大章出画布时常见）。
+
+### 1.4 同色多图章并集覆盖
+
+对色区 \(R\)（mask \(M_R\)、颜色 \(c\)），放置同色层集合 \(\{L_{i_1},\ldots,L_{i_m}\}\)（均 `fill`=\(c\)）使得：
+
+\[
+U=\bigcup_{k=1}^{m} \mathrm{mask}(L_{i_k}),\quad
+\mathrm{cover}=\frac{|U\cap M_R|}{|M_R|},\quad
+\mathrm{leak}=\frac{|U\setminus M_R|}{|U|}
+\]
+
+| 规则 | 说明 |
+|------|------|
+| **不限一区一章** | \(m\ge 1\)，受 `max_stamps_per_region` 与全局 40 层约束 |
+| **同色** | 并集内层强制同一 `fill`，否则交叠会显脏色 |
+| **贪心残差** | 先匹配 \(M_R\)；再对 \(M_R\setminus U\) 的连通残差继续匹配 |
+| **停止** | cover 达标 / 增益过小 / 泄漏过大 / 层预算尽 |
+| **层序** | 同色组在 π 中相邻放置（同 depth 带），避免异色插花破坏并集 |
+
+实现：`union_cover.cover_region_with_union_stamps`；配置见 `ApproxConfig.max_stamps_per_region` 等。
 
 ---
 
@@ -166,18 +188,18 @@ T^\star = \arg\min_T \;
 
 ### 3.1 平面化（P1）
 
-- 色彩空间：CIELAB 聚类（或层次量化）。  
-- **初始 K 偏大**（例如 8–12），以便边界清楚；不是一上来压成 3～4 色糊成一片。  
+- 色彩空间：CIELAB **严格 k-means**（K=`num_colors`）。  
+- **不做**近色/同色相/阴影软合并；调色板长度由 K 决定（空簇 compact 后可能略少）。  
 - 平滑：边缘保持（轻度），避免为「好贴章」过度抹掉结构。  
 - 输出：标签图 \(L(x,y)\)、调色板 \(\{c_k\}\)、α。  
-- **演进（补篇 Batch A/B）**：自适应重采样少造软边；平坦区估调色板；空间正则减杂色丝；**主体内 `gap_frac=0`**。详见补篇。
+- 自适应重采样少造软边；空间正则减杂色丝；**主体内 `gap_frac=0`**。详见补篇。
 
 ### 3.2 区域规整（P2）
 
 - 每色连通域 → 区域 \(R_k=(mask_k, c_k, area, \partial R_k)\)。  
 - 过小域并入邻域（阈值与画布比例相关，**与内容语义无关**）；**禁止**主体内标 -1 留洞。  
 - 构建 **区域邻接图** \(G\)：边表示两色相接，权重为共享边界长度。  
-- **演进（补篇 Batch C）**：邻接升级为 **SharedEdge 平面图**（几何只存一份），消灭「双侧独立轮廓」拼合缝。详见补篇。
+- 邻接为 **SharedEdge 平面图**（几何只存一份）；当前主路径为精确折线描边（参数曲线拟合见后续实现）。详见补篇。
 
 ### 3.3 层序假设 π（P3）——关键
 
@@ -425,7 +447,7 @@ loop:
 
 ## 11. 与代码的对应（落地清单）
 
-| v3 要求 | 代码 |
+| 要求 | 代码 |
 |---------|------|
 | 无形状路由；描述子 top-M 全库自动选 | `match_curve.py` + `stamp_curves.recall`（默认 `stamp_subset=None` 全库） |
 | 曲线 Chamfer 为主，IoU 辅助 | `match_curve.chamfer_loss_torch` + `_score_curve_and_cover` |
@@ -438,21 +460,21 @@ loop:
 | 特殊章渐变通道 | `special_fx.py`（radial/star/grid/gradient_candidate） |
 | GPU 粒子服务曲线损失 | `torch_render.py` + `match_curve` 批量 `grid_sample` |
 | 曲线+色彩综合评分 | `metrics.py`（可见边界 Chamfer × LAB 色 × line × simple，均 GPU） |
-| SVG 预拟合 CLI | `bfemblem prefit-stamps` → `StampCurveLibrary.prefit_directory` |
-| 图章曲线预拟合 | `stamp_curves.py`：默认 **256²** 栅格；**Moore 跟踪**外轮廓+内部孔；α≥96；多环描述子；缓存 v4 → `assets/.cache/stamp_curves` |
-| 由简入繁 | `k_start=4` 粗阶段少色大块 + `coarse_max_regions`；细阶段升 K + 残差；特效仅细阶段 |
-| 弧基元→图章 | 优质圆/椭圆基元时抬高区域简洁度、前置低 complexity 候选、完整形体播种 |
+| 主动预计算 CLI | `bfemblem prefit-stamps` → `StampCurveLibrary.prefit_directory`（全量覆盖缓存） |
+| 图章曲线缓存 | `stamp_curves.py`：并行 SVG 栅格 + 批量 GPU SDF；**Moore + CC 内洞** 密轮廓 + 面积约束；α≥96；多环描述子；缺 `.npz` 补算，全量覆盖仅 `prefit-stamps` |
+| 少色/严格色量 | `num_colors` 严格 LAB k-means；`max_regions` 限制平面图面数；特效按剩余层预算 |
+| 同色多图章并集覆盖 | `union_cover.cover_region_with_union_stamps` + `pipeline` 按区贪心残差；配置 `max_stamps_per_region` / `region_min_cover` |
 
 模块：
 
 ```text
 approx/
   gpu_ops.py        # 共用 GPU 算子（形态学/CC/Chamfer/LAB/线质）
-  planarize.py      # P1 多级 K（GPU k-means）
+  planarize.py      # P1 严格 num_colors（LAB k-means）
   regions.py        # P2 邻接图（GPU morph/CC/邻接）
   depth_order.py    # P3 层序 π
   contour_arcs.py   # P4 分段与圆/椭圆拟合（GPU SVD/lstsq）
-  stamp_curves.py   # P5 全库+效果标签+强制重拟合缓存
+  stamp_curves.py   # 全库+效果标签+按需/主动预计算缓存
   match_curve.py    # P6 曲线损失+出画布（无形状桶，GPU）
   special_fx.py     # P7（GPU 粒子）
   assemble.py       # P8（GPU 合成/Chamfer）
@@ -473,7 +495,7 @@ approx/
 - 区域邻接图 + 简单 π；  
 - 轮廓分段 + 圆/椭圆拟合可视化（调试拼图：原图/标签/弧段/层序）。
 
-### Phase B — 曲线匹配 MVP
+### 曲线匹配落地清单
 
 - 图章全库（或 64+）曲线检索；  
 - GPU 粒子 + Chamfer（有损 Huber）；  
@@ -516,10 +538,3 @@ approx/
 
 ---
 
-## 修订
-
-| 版本 | 日期 | 说明 |
-|------|------|------|
-| 0.5 | 2026-07-19 | 挂接补篇 MVP 落地对照：标签场/SharedEdge/seam_p95 模块表 |
-| 0.4 | 2026-07-19 | 主路径落地：模块对照、prefit-stamps、曲线+色彩评分 |
-| 0.3 | 2026-07-19 | 初稿：废除形状路由；可见边界+层序；弧基元；曲线匹配；特效章；多级 K；交付物 |

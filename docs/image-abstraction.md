@@ -190,23 +190,21 @@ K_eff ≈ min(K, max_layers / 3)
 
 | 算法 | 说明 |
 |------|------|
-| **K-means in LAB**（仅 α>0.5 像素） | MVP 默认 |
-| Median cut | 经典调色板备选 |
-| K-means++ 多次初始化取最佳 | 减抖动 |
-| SLIC 超像素均色 → 再聚类 | 空间更稳，Phase 2 |
+| **K-means in LAB**（仅 α>0.5 像素，K=`num_colors`） | **当前唯一色量路径** |
+| K-means++ 初始化 | 减抖动 |
 
 ```text
 pixels = { LAB(p) | α(p) > 0.5 }
-palette = kmeans(pixels, K)
-label(p) = nearest_palette(LAB(p))   # α 外可标 background
+palette = kmeans(pixels, K=num_colors)   # 严格 K，不做近色软合并
+label(p) = nearest_palette(LAB(p))       # α 外可标 background
 image_q(p) = sRGB(palette[label(p)])
 ```
 
 #### 3.3 调色板后处理
 
-1. **合并过近色**：LAB 距离 < τ 则并簇  
-2. **剔极小色**：面积比 < 0.5% 并入最近色（中心/高权重区可豁免）  
-3. **按面积排序**：`palette[0]` → 底色候选  
+1. **不做**近色 / 色相 / 阴影合并（严格色量）  
+2. 过小**连通域**并入邻域众数（空间规整，不改色中心）  
+3. **按面积排序** compact 空簇  
 4. 导出 `[(#RRGGBB, fraction), ...]` 供搜索时的 `fill` 候选
 
 #### 3.4 全局量化的局限与改进
@@ -406,8 +404,3 @@ Pydantic 模型建议：`ApproxConfig`, `PaletteColor`, `ApproxTarget`, `ApproxM
 
 ---
 
-## 修订
-
-| 版本 | 日期 | 说明 |
-|------|------|------|
-| 0.1 | 2026-07-19 | 初稿：六阶段管线、模式、参数、接口、分期 |

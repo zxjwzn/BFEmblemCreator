@@ -1,4 +1,4 @@
-"""P6：曲线匹配 — 描述子 top-M + GPU 粒子 + Chamfer（有损），无形状路由。"""
+"""曲线匹配：描述子 top-M + GPU 粒子 + Chamfer（有损），无形状路由。"""
 
 from __future__ import annotations
 
@@ -229,7 +229,7 @@ def match_region_with_particles(
     """
     对区域做曲线导向的大尺度粒子搜索。
 
-    target_curve_pts：可选，来自 SharedEdge 去重后的 SHAPE 边界点（Batch E）。
+    target_curve_pts：可选，来自 SharedEdge 去重后的 SHAPE 边界点。
     未提供时回退 region.contour_resampled。
     """
     device = renderer.device
@@ -549,50 +549,4 @@ def refine_layer_particles(
         height=float(height[i]),
         width=float(width[i]),
         fill=layer.fill,
-    )
-
-
-def match_block_with_particles(
-    block: object,
-    curve_lib: StampCurveLibrary,
-    renderer: TorchStampRenderer,
-    *,
-    primitives: list[ArcPrimitive] | None = None,
-    n_particles: int = 256,
-    recall_k: int = 48,
-    seed: int = 0,
-    min_score: float = 0.12,
-    prefer_primitive_seed: bool = True,
-) -> StampLayer | None:
-    """兼容 ColorBlock：转成 Region 后匹配。"""
-    from bf_emblem_creator.approx.blocks import ColorBlock
-    from bf_emblem_creator.approx.regions import Region as R
-
-    if not isinstance(block, ColorBlock):
-        raise TypeError("block 须为 ColorBlock")
-    cr = block.color_rgb
-    bb = block.bbox
-    region = R(
-        region_id=int(block.depth_hint),
-        color_hex=str(block.color_hex),
-        color_rgb=(int(cr[0]), int(cr[1]), int(cr[2])),
-        area_frac=float(block.area_frac),
-        bbox=(int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])),
-        mask=block.mask,
-        contour=block.contour,
-        contour_resampled=block.contour_resampled,
-        descriptor=block.descriptor,
-        sdf=block.sdf,
-        depth=int(block.depth_hint),
-    )
-    return match_region_with_particles(
-        region,
-        curve_lib,
-        renderer,
-        primitives=primitives,
-        n_particles=n_particles,
-        recall_k=recall_k,
-        seed=seed,
-        min_score=min_score,
-        prefer_primitive_seed=prefer_primitive_seed,
     )

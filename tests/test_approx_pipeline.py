@@ -1,4 +1,4 @@
-"""v3 近似：平面化、弧基元、曲线评分、GPU 粒子与综合评分。"""
+"""近似管线：平面化、弧基元、曲线评分、GPU 粒子与综合评分。"""
 
 from __future__ import annotations
 
@@ -14,17 +14,18 @@ from bf_emblem_creator.approx.curves import extract_outer_contour, rdp
 from bf_emblem_creator.approx.depth_order import infer_depth_order
 from bf_emblem_creator.approx.line_quality import evaluate_line_quality
 from bf_emblem_creator.approx.metrics import score_prediction
-from bf_emblem_creator.approx.models import ApproxConfig
+from bf_emblem_creator.approx.models import AbstractionMode
 from bf_emblem_creator.approx.pipeline import approximate_image
+from bf_emblem_creator.approx.planar_map import build_planar_map, planar_map_to_region_graph
 from bf_emblem_creator.approx.planarize import planarize_image
-from bf_emblem_creator.approx.regions import build_regions
+from bf_emblem_creator.approx.recipe import ImageProcessorConfig, default_recipe_for_mode
 from bf_emblem_creator.approx.stamp_curves import StampCurveLibrary
 from bf_emblem_creator.approx.torch_render import TorchStampRenderer
 from bf_emblem_creator.stamps import StampLibrary
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMPS = ROOT / "assets" / "stamps"
-EMOJI = ROOT / "examples" / "😄.png"
+EMOJI = ROOT / "examples" / "smile.png"
 
 
 def test_line_quality_smooth_circle_high() -> None:
@@ -71,18 +72,20 @@ def test_rdp_and_contour() -> None:
 
 
 def test_planarize_and_depth_order() -> None:
-    """平面化 + 区域 + 层序应产出有序区域。"""
+    """平面化 + SharedEdge 区域 + 层序应产出有序区域。"""
+
     result = planarize_image(
         EMOJI,
-        ApproxConfig(stamps_dir=STAMPS, palette_k=6, use_cuda=torch.cuda.is_available()),
-        k=6,
+        ImageProcessorConfig(num_colors=6, use_cuda=torch.cuda.is_available()),
+        mode=AbstractionMode.illustration,
     )
     labels, palette, alpha = result[0], result[1], result[2]
     assert palette
     assert labels.max() >= 0
-    graph = build_regions(labels, palette, alpha, min_area_frac=0.005)
+    pmap = build_planar_map(labels, palette, alpha, min_area_frac=0.005)
+    graph = planar_map_to_region_graph(pmap)
     assert len(graph.regions) >= 1
-    depth = infer_depth_order(graph)
+    depth = infer_depth_order(graph, planar_map=pmap)
     assert len(depth.ordered) == len(graph.regions)
     # 底层面积通常不小于顶层
     if len(depth.ordered) >= 2:
@@ -90,20 +93,22 @@ def test_planarize_and_depth_order() -> None:
 
 
 def test_arc_segmentation() -> None:
-    """圆轮廓可分段并拟合出圆/椭圆弧。"""
+    """圆轮廓可分段；精确路径下 fit 返回 free（不概括为圆）。"""
     t = np.linspace(0, 2 * np.pi, 64, endpoint=False)
     circle = np.stack([40 + 25 * np.cos(t), 40 + 25 * np.sin(t)], axis=1)
     segs = segment_contour(circle, closed=True)
     assert len(segs) >= 1
     ptype, params, res, hard = fit_segment_primitive(segs[0], eps_arc=0.08)
-    assert ptype.value in {"circle_arc", "ellipse_arc", "line", "free"}
+    assert ptype.value == "free"
     assert res >= 0.0
-    _ = hard
+    assert hard
     _ = params
 
 
 def test_abstract_blocks_emoji() -> None:
-    target = abstract_to_blocks(EMOJI, ApproxConfig(stamps_dir=STAMPS, palette_k=4))
+    target = abstract_to_blocks(
+        EMOJI, default_recipe_for_mode(AbstractionMode.illustration).override(stamps_dir=STAMPS, num_colors=4)
+    )
     assert target.canvas_size == 320
     assert len(target.blocks) >= 1
     assert target.blocks[0].area_frac > 0.01
@@ -146,7 +151,7 @@ def test_moore_contour_with_hole() -> None:
 def test_stamp_curve_library_full_no_shape_bucket() -> None:
     """多环高精度构建 + 描述子召回，无形状桶。"""
     lib = StampLibrary(STAMPS)
-    cache = ROOT / "assets" / ".cache" / "stamp_curves_test_v4"
+    cache = ROOT / "assets" / ".cache" / "stamp_curves_test"
     curves = StampCurveLibrary.build(
         lib,
         ["Circle", "Square", "Triangle", "Star", "OpenCircle", "Line"],
@@ -160,18 +165,21 @@ def test_stamp_curve_library_full_no_shape_bucket() -> None:
     assert curves.by_id["Circle"].tex_size == 96
     ids = curves.recall(curves.by_id["Circle"].descriptor, 0.9, 1.1, k=3)
     assert len(ids) == 3
-    # OpenCircle 应识别到孔或 ring 标签
+    # OpenCircle 应识别到孔与 ring 标签
     if "OpenCircle" in curves.by_id:
         oc = curves.by_id["OpenCircle"]
-        assert oc.n_holes >= 1 or "ring" in oc.tags
+        assert oc.n_holes >= 1
+        assert "ring" in oc.tags or oc.n_holes >= 1
         rings = curves.all_rings_normalized("OpenCircle")
-        assert len(rings) >= 1
+        assert len(rings) >= 2
     again = StampCurveLibrary.prefit_directory(STAMPS, cache_dir=cache, tex_size=96)
     assert len(again.entries) >= 1
 
 
 def test_score_curve_and_color() -> None:
-    target = abstract_to_blocks(EMOJI, ApproxConfig(stamps_dir=STAMPS, palette_k=4))
+    target = abstract_to_blocks(
+        EMOJI, default_recipe_for_mode(AbstractionMode.illustration).override(stamps_dir=STAMPS, num_colors=4)
+    )
     rgb = target.numpy_rgb()
     a = (target.numpy_alpha() * 255).astype(np.uint8)
     rgba = np.dstack([rgb, a])
@@ -183,47 +191,44 @@ def test_score_curve_and_color() -> None:
 
 
 @pytest.mark.timeout(240)
-def test_approximate_emoji_v3() -> None:
-    """v3 拟合应在时限内完成并产出 JSON 层。"""
-    # 测试用小子集加速
+def test_approximate_emoji() -> None:
+    """拟合应在时限内完成并产出 JSON 层。"""
     subset = ["Circle", "Square", "OpenCircle", "Drop", "Triangle", "HalfCircle", "Line", "Banner"]
-    cfg = ApproxConfig(
+    recipe = default_recipe_for_mode(AbstractionMode.illustration).override(
         stamps_dir=STAMPS,
         max_layers=12,
-        palette_k=4,
-        k_start=4,
-        k_max=6,
-        k_max_iters=1,
-        delta_k=2,
-        n_margin=2,
+        num_colors=4,
+        max_faces=12,
         pass_score=0.25,
-        recall_k=8,
-        refine=True,
-        refine_iters=1,
-        seed=0,
-        stamp_subset=subset,
+        asset_allowlist=subset,
         enable_special_fx=False,
+        refine=True,
+        seed=0,
+        use_cuda=torch.cuda.is_available(),
+        n_particles=64,
     )
-    result = approximate_image(EMOJI, cfg, n_particles=64, use_cuda=torch.cuda.is_available())
+    recipe = recipe.model_copy(update={"match": recipe.match.model_copy(update={"recall_k": 8, "refine_iters": 1})})
+    result = approximate_image(EMOJI, recipe, n_particles=64)
     assert len(result.document) >= 1
     assert len(result.document) <= 12
     assert result.elapsed_sec < 200.0
     assert result.score.n_layers == len(result.document)
     assert result.stop_reason
     assert result.blocks_found >= 1
-    assert result.k_used >= 4
+    assert result.k_used == 4
     assert result.preview_rgb is not None
     assert 0.0 <= result.score.sim.edge_score <= 1.0
 
 
 def test_region_primitives_extract() -> None:
+
     labels, palette, alpha, _, _, _ = planarize_image(
         EMOJI,
-        ApproxConfig(stamps_dir=STAMPS, palette_k=4, use_cuda=False),
-        k=4,
-        device=torch.device("cpu"),
+        ImageProcessorConfig(num_colors=4, use_cuda=False),
+        mode=AbstractionMode.illustration,
     )
-    graph = build_regions(labels, palette, alpha, min_area_frac=0.01)
+    pmap = build_planar_map(labels, palette, alpha, min_area_frac=0.01)
+    graph = planar_map_to_region_graph(pmap)
     if not graph.regions:
         pytest.skip("无区域")
     prims = extract_primitives_for_region(graph.regions[0], depth=0, eps_arc=0.06)

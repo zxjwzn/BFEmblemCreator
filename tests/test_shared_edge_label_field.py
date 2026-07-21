@@ -1,4 +1,4 @@
-"""Batch A–E：自适应重采样、标签场无洞、共享边平面图与缝宽。"""
+"""自适应重采样、标签场无洞、共享边平面图与缝宽。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from bf_emblem_creator.approx.label_field import (
     gap_fraction,
     icm_label_refine,
 )
-from bf_emblem_creator.approx.models import ApproxConfig, ResampleMode
+from bf_emblem_creator.approx.models import AbstractionMode, ResampleMode
 from bf_emblem_creator.approx.planar_map import (
     assert_planar_map_valid,
     build_planar_map,
@@ -30,7 +30,7 @@ from bf_emblem_creator.approx.planar_map import (
 )
 from bf_emblem_creator.approx.planarize import planarize_image
 from bf_emblem_creator.approx.preprocess import detect_resample_mode, estimate_color_stats, fit_to_canvas
-from bf_emblem_creator.approx.regions import build_regions
+from bf_emblem_creator.approx.recipe import ImageProcessorConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 GOLD = ROOT / "examples" / "gold.png"
@@ -72,7 +72,9 @@ def test_label_field_no_gap_hard_edge() -> None:
     """硬边两色：gap=0。"""
     rgb = _two_color_hard(48)[:, :, :3]
     alpha = np.ones((48, 48), dtype=np.float64)
-    labels, palette, gf, _nf = build_label_field(rgb, alpha, k=3, mrf_iters=3, min_area_frac=0.01, enforce_no_gap=True, seed=0)
+    labels, palette, gf, _nf = build_label_field(
+        rgb, alpha, num_colors=3, mrf_iters=3, min_area_frac=0.01, enforce_no_gap=True, seed=0
+    )
     assert gf == 0.0
     assert gap_fraction(labels, alpha) == 0.0
     assert len(palette) >= 2
@@ -92,7 +94,7 @@ def test_label_field_soft_edge_no_long_third_filament() -> None:
     labels, palette, gf, nf = build_label_field(
         rgb,
         alpha,
-        k=4,
+        num_colors=4,
         mrf_lambda=3.0,
         mrf_iters=6,
         min_area_frac=0.02,
@@ -115,15 +117,16 @@ def test_label_field_soft_edge_no_long_third_filament() -> None:
 
 
 def test_fill_label_gaps_and_regions_no_gap() -> None:
-    """regions 在强制无洞时主体全覆盖。"""
+    """planar_map 区域主体全覆盖（无洞）。"""
     rgb = _two_color_hard(40)[:, :, :3]
     alpha = np.ones((40, 40), dtype=np.float64)
-    labels, palette, _, _ = build_label_field(rgb, alpha, k=2, mrf_iters=2, enforce_no_gap=True)
+    labels, palette, _, _ = build_label_field(rgb, alpha, num_colors=2, mrf_iters=2, enforce_no_gap=True)
     # 人为挖洞
     labels[10:12, 10:12] = -1
     labels = fill_label_gaps(labels, alpha)
     assert gap_fraction(labels, alpha) == 0.0
-    graph = build_regions(labels, palette, alpha, min_area_frac=0.01, max_regions=8, enforce_no_gap=True)
+    pmap = build_planar_map(labels, palette, alpha, min_area_frac=0.01, max_faces=8)
+    graph = planar_map_to_region_graph(pmap)
     covered = np.zeros((40, 40), dtype=bool)
     for r in graph.regions:
         covered |= np.asarray(r.mask, dtype=bool)
@@ -134,7 +137,7 @@ def test_planar_map_two_color_and_valid() -> None:
     """左右两色平面图可校验。"""
     rgb = _two_color_hard(32)[:, :, :3]
     alpha = np.ones((32, 32), dtype=np.float64)
-    labels, palette, gf, _ = build_label_field(rgb, alpha, k=2, mrf_iters=2, enforce_no_gap=True)
+    labels, palette, gf, _ = build_label_field(rgb, alpha, num_colors=2, mrf_iters=2, enforce_no_gap=True)
     pmap = build_planar_map(labels, palette, alpha, min_area_frac=0.01, max_faces=8, gap_frac=gf)
     assert_planar_map_valid(pmap)
     assert len(pmap.faces) >= 2
@@ -167,7 +170,7 @@ def test_face_shape_boundary_points_dedup_edge_id() -> None:
     """匹配目标点按 edge_id 去重：同一共边不会因两侧 face 重复计入单 face 点云逻辑。"""
     rgb = _two_color_hard(40)[:, :, :3]
     alpha = np.ones((40, 40), dtype=np.float64)
-    labels, palette, gf, _ = build_label_field(rgb, alpha, k=2, enforce_no_gap=True)
+    labels, palette, gf, _ = build_label_field(rgb, alpha, num_colors=2, enforce_no_gap=True)
     pmap = build_planar_map(labels, palette, alpha, gap_frac=gf)
     f0 = pmap.faces[0].id
     pts = face_shape_boundary_points(pmap, f0, only_shape=True)
@@ -181,7 +184,7 @@ def test_edge_subpixel_refines_without_breaking_topology() -> None:
     """亚像素精修保持拓扑 id 与校验。"""
     rgb = _two_color_hard(48)[:, :, :3]
     alpha = np.ones((48, 48), dtype=np.float64)
-    labels, palette, gf, _ = build_label_field(rgb, alpha, k=2, enforce_no_gap=True)
+    labels, palette, gf, _ = build_label_field(rgb, alpha, num_colors=2, enforce_no_gap=True)
     pmap = build_planar_map(labels, palette, alpha, gap_frac=gf, edge_subpixel=True)
     assert_planar_map_valid(pmap)
     eids_before = {e.id for e in pmap.edges}
@@ -194,7 +197,7 @@ def test_shared_edge_primitives_and_seam_metric() -> None:
     """边上基元提取与 seam_p95 可计算。"""
     rgb = _two_color_hard(48)[:, :, :3]
     alpha = np.ones((48, 48), dtype=np.float64)
-    labels, palette, gf, _ = build_label_field(rgb, alpha, k=2, enforce_no_gap=True)
+    labels, palette, gf, _ = build_label_field(rgb, alpha, num_colors=2, enforce_no_gap=True)
     pmap = build_planar_map(labels, palette, alpha, gap_frac=gf)
     prims = extract_primitives_for_shared_edges(pmap.edges, eps_arc=0.08)
     assert len(prims) >= 1
@@ -209,16 +212,17 @@ def test_planarize_gold_gap_zero_if_present() -> None:
     """gold.png 平面化后 gap_frac=0，且 auto 倾向 nearest。"""
     if not GOLD.is_file():
         return
-    cfg = ApproxConfig(
+    from bf_emblem_creator.approx.models import ResampleMode
+
+    cfg = ImageProcessorConfig(
         canvas_size=160,
-        palette_k=4,
-        k_start=4,
+        num_colors=4,
         use_cuda=False,
         mrf_iters=4,
         enforce_no_gap=True,
         resample_mode=ResampleMode.auto,
     )
-    labels, palette, alpha, _image_q, meta, _src = planarize_image(GOLD, cfg, k=4)
+    labels, palette, alpha, _image_q, meta, _src = planarize_image(GOLD, cfg, mode=AbstractionMode.illustration)
     assert meta.gap_frac == 0.0 or gap_fraction(labels, alpha) == 0.0
     assert meta.resample in {"nearest", "lanczos", "bilinear"}
     assert len(palette) >= 2
@@ -237,7 +241,9 @@ def test_icm_reduces_isolated_noise() -> None:
     rgb[5, 5] = (40, 40, 200)
     rgb[6, 7] = (40, 40, 200)
     alpha = np.ones((h, w), dtype=np.float64)
-    labels0, palette, _, _ = build_label_field(rgb, alpha, k=2, mrf_iters=0, enforce_no_gap=True, min_area_frac=0.001, seed=0)
+    labels0, palette, _, _ = build_label_field(
+        rgb, alpha, num_colors=2, mrf_iters=0, enforce_no_gap=True, min_area_frac=0.001, seed=0
+    )
     labels1 = icm_label_refine(rgb, alpha, labels0, palette, mrf_lambda=4.0, iters=8)
     # 噪声点更可能并回左色
     left = labels1[:, : w // 2]

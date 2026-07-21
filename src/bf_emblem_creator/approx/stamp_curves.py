@@ -1,8 +1,11 @@
-"""图章边缘曲线库 + 效果标签 + 磁盘缓存（高精度多环轮廓，全库可检索）。"""
+"""图章边缘曲线库 + 效果标签 + 磁盘缓存（多环轮廓，全库可检索）。"""
 
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,25 +14,43 @@ import torch
 from numpy.typing import NDArray
 
 from bf_emblem_creator.approx.curves import (
-    extract_contour_bundle,
+    fit_mask_contour_high_precision,
     multi_ring_descriptor,
     normalize_contour_to_unit,
     resample_closed_contour,
     signed_area,
 )
 from bf_emblem_creator.approx.device import get_device
-from bf_emblem_creator.approx.gpu_ops import mask_to_sdf_fast, to_torch
+from bf_emblem_creator.approx.gpu_ops import batch_mask_to_sdf, mask_to_sdf_fast, to_torch
 from bf_emblem_creator.raster import rasterize_svg
 from bf_emblem_creator.stamps import StampLibrary
 
 FloatArr = NDArray[np.floating]
 U8Arr = NDArray[np.uint8]
 
-# 缓存格式：多环 + 高分辨率；变更时递增强制重拟合
-CACHE_VERSION = 4
 DEFAULT_TEX_SIZE = 256
-DEFAULT_RESAMPLE_N = 192
-DEFAULT_SIMPLIFY = 0.35
+DEFAULT_RESAMPLE_N = 256
+DEFAULT_AREA_REL_ERR = 0.03
+DEFAULT_WORKERS = 8
+DEFAULT_SDF_BATCH = 32
+
+# 单图章缓存文件必须具备的字段（缺一则视为无缓存，重新计算）
+_NPZ_REQUIRED_KEYS = (
+    "contour",
+    "contour_px",
+    "holes",
+    "holes_px",
+    "descriptor",
+    "sdf",
+    "circularity",
+    "elongation",
+    "area_frac",
+    "tex_size",
+    "n_holes",
+    "complexity",
+    "contour_area_rel_err",
+    "tags",
+)
 
 
 def geometric_complexity(
@@ -47,18 +68,13 @@ def geometric_complexity(
     """
     c = float(np.clip(circularity, 0.0, 2.0))
     e = float(max(elongation, 1.0))
-    # 圆度惩罚：circ 越低越复杂
     p_circ = float(np.clip(1.0 - min(c, 1.0), 0.0, 1.0))
-    # 孔洞
     p_hole = float(np.clip(n_holes / 4.0, 0.0, 1.0))
-    # 细长
     p_elong = float(np.clip(np.log(e) / np.log(6.0), 0.0, 1.0))
-    # 描述子 L2 起伏
     p_desc = 0.0
     if descriptor is not None and len(descriptor) > 2:
         d = np.asarray(descriptor, dtype=np.float64)
         p_desc = float(np.clip(d.std() * 4.0, 0.0, 1.0))
-    # 中等填充剪影往往轮廓更碎
     af = float(np.clip(area_frac, 0.0, 1.0))
     p_fill = float(np.clip(1.0 - abs(af - 0.55) * 2.0, 0.0, 0.5)) * 0.5
     raw = 0.40 * p_circ + 0.25 * p_hole + 0.15 * p_elong + 0.15 * p_desc + 0.05 * p_fill
@@ -70,10 +86,10 @@ class StampCurveEntry:
     """单个图章的多环曲线 / SDF / 效果标签。"""
 
     asset_id: str
-    contour: FloatArr  # 主外轮廓，归一化到 [-0.5,0.5]^2
-    contour_px: FloatArr  # 主外轮廓像素坐标
-    holes: list[FloatArr] = field(default_factory=list)  # 孔洞（归一化）
-    holes_px: list[FloatArr] = field(default_factory=list)  # 孔洞像素
+    contour: FloatArr
+    contour_px: FloatArr
+    holes: list[FloatArr] = field(default_factory=list)
+    holes_px: list[FloatArr] = field(default_factory=list)
     descriptor: FloatArr = field(default_factory=lambda: np.zeros(27, dtype=np.float64))
     sdf: FloatArr = field(default_factory=lambda: np.zeros((1, 1), dtype=np.float32))
     tex_size: int = DEFAULT_TEX_SIZE
@@ -83,7 +99,7 @@ class StampCurveEntry:
     tags: list[str] = field(default_factory=list)
     n_holes: int = 0
     complexity: float = 0.0
-    """通用几何复杂度 0~1（非场景）：低圆度、多孔、高细长、描述子起伏 → 更高。"""
+    contour_area_rel_err: float = 0.0
 
 
 def detect_effect_tags(
@@ -111,8 +127,19 @@ def detect_effect_tags(
     return tags
 
 
+def _raster_one(args: tuple[str, Path, int]) -> tuple[str, U8Arr | None, str | None]:
+    """线程池任务：单图章 SVG→RGBA。"""
+    asset_id, path, tex_size = args
+    try:
+        rgba = rasterize_svg(path, out_width=tex_size, out_height=tex_size)
+    except Exception as exc:  # noqa: BLE001
+        return asset_id, None, str(exc)
+    else:
+        return asset_id, rgba, None
+
+
 class StampCurveLibrary:
-    """全库图章曲线库（描述子检索，多环高精度）。"""
+    """全库图章曲线库（描述子检索，多环轮廓）。"""
 
     def __init__(self, entries: list[StampCurveEntry]) -> None:
         self.entries = entries
@@ -127,82 +154,210 @@ class StampCurveLibrary:
         tex_size: int = DEFAULT_TEX_SIZE,
         cache_dir: str | Path | None = None,
         force_refit: bool = False,
-        simplify: float = DEFAULT_SIMPLIFY,
         resample_n: int = DEFAULT_RESAMPLE_N,
+        max_area_rel_err: float = DEFAULT_AREA_REL_ERR,
+        workers: int = DEFAULT_WORKERS,
+        progress_cb: Callable[[str], None] | None = None,
+        sdf_batch: int = DEFAULT_SDF_BATCH,
     ) -> StampCurveLibrary:
         """
         构建曲线库。
 
-        asset_ids=None → 目录下全部图章。
-        force_refit=True → 忽略缓存并重写。
-        tex_size 默认 256，保证内部闭合边精度。
+        - 默认：磁盘上已有完整缓存则直接加载；缺哪些图章只补算哪些，并写回缓存。
+        - force_refit=True：忽略已有缓存，全量重算并覆盖（供 prefit-stamps 主动预计算）。
+        - asset_ids=None → 目录下全部图章。
         """
         ids = list(asset_ids) if asset_ids is not None else list(library.list_ids())
         ids = sorted(ids)
         cache_path = Path(cache_dir) if cache_dir else None
+        log = progress_cb or (lambda _msg: None)
+
+        cached: dict[str, StampCurveEntry] = {}
         if cache_path is not None and not force_refit:
             cache_path.mkdir(parents=True, exist_ok=True)
-            meta_file = cache_path / "stamp_curves_meta.json"
-            if meta_file.is_file():
-                try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                    if (
-                        meta.get("version") == CACHE_VERSION
-                        and meta.get("tex_size") == tex_size
-                        and meta.get("ids") == ids
-                        and meta.get("resample_n", DEFAULT_RESAMPLE_N) == resample_n
-                    ):
-                        return cls._load_cache(cache_path, ids, tex_size)
-                except Exception:
-                    pass
+            for aid in ids:
+                entry = cls._try_load_entry(cache_path, aid)
+                if entry is not None:
+                    cached[aid] = entry
+            if len(cached) == len(ids) and ids:
+                log(f"加载图章曲线缓存（{len(ids)} 个，完整命中）…")
+                return cls([cached[aid] for aid in ids])
+            if cached:
+                log(f"缓存部分命中 {len(cached)}/{len(ids)}，补算缺失项…")
 
+        need_ids = [aid for aid in ids if aid not in cached]
+        if not need_ids and not ids:
+            raise RuntimeError("图章曲线库为空（无可用 SVG）")
+        if not need_ids:
+            return cls([cached[aid] for aid in ids])
+
+        computed = cls._compute_entries(
+            library,
+            need_ids,
+            tex_size=tex_size,
+            resample_n=resample_n,
+            max_area_rel_err=max_area_rel_err,
+            workers=workers,
+            sdf_batch=sdf_batch,
+            log=log,
+        )
+        if cache_path is not None:
+            cache_path.mkdir(parents=True, exist_ok=True)
+            log(f"写入缓存 {cache_path}（{len(computed)} 个）…")
+            for e in computed:
+                cls._save_entry(cache_path, e)
+            cls._write_index(
+                cache_path,
+                assets=sorted({*cached.keys(), *[e.asset_id for e in computed]}),
+                tex_size=tex_size,
+                resample_n=resample_n,
+                max_area_rel_err=max_area_rel_err,
+            )
+
+        by_id = {**cached, **{e.asset_id: e for e in computed}}
+        entries = [by_id[aid] for aid in ids if aid in by_id]
+        if not entries:
+            raise RuntimeError("图章曲线库为空")
+        return cls(entries)
+
+    @classmethod
+    def prefit_directory(
+        cls,
+        stamps_dir: str | Path,
+        *,
+        cache_dir: str | Path | None = None,
+        tex_size: int = DEFAULT_TEX_SIZE,
+        resample_n: int = DEFAULT_RESAMPLE_N,
+        max_area_rel_err: float = DEFAULT_AREA_REL_ERR,
+        workers: int = DEFAULT_WORKERS,
+        progress_cb: Callable[[str], None] | None = None,
+    ) -> StampCurveLibrary:
+        """主动预计算：全量重算目录下全部图章并覆盖写入缓存。"""
+        library = StampLibrary(stamps_dir)
+        stamps_path = Path(stamps_dir)
+        cache = Path(cache_dir) if cache_dir else stamps_path.parent / ".cache" / "stamp_curves"
+        return cls.build(
+            library,
+            asset_ids=None,
+            tex_size=tex_size,
+            cache_dir=cache,
+            force_refit=True,
+            resample_n=resample_n,
+            max_area_rel_err=max_area_rel_err,
+            workers=workers,
+            progress_cb=progress_cb,
+        )
+
+    @classmethod
+    def _compute_entries(
+        cls,
+        library: StampLibrary,
+        ids: list[str],
+        *,
+        tex_size: int,
+        resample_n: int,
+        max_area_rel_err: float,
+        workers: int,
+        sdf_batch: int,
+        log: Callable[[str], None],
+    ) -> list[StampCurveEntry]:
+        """对给定 id 列表做栅格 + SDF + 轮廓拟合（不读缓存）。"""
         dev = get_device()
-        entries: list[StampCurveEntry] = []
+        log(f"拟合图章曲线：device={dev} workers={workers} tex={tex_size} n={len(ids)}")
+        t0 = time.perf_counter()
+
+        jobs: list[tuple[str, Path, int]] = []
         for asset_id in ids:
             try:
                 info = library.resolve(asset_id)
+                jobs.append((asset_id, info.path, tex_size))
             except FileNotFoundError:
                 continue
-            # SVG→栅格（PyMuPDF）；高分辨率后掩膜全程 GPU/高精度跟踪
-            rgba = rasterize_svg(info.path, out_width=tex_size, out_height=tex_size)
-            alpha_t = to_torch(rgba[:, :, 3].astype(np.float32), device=dev)
-            # 略软阈值：保留抗锯齿内侧，减少收缩
-            mask_t = alpha_t >= 96.0
-            if not bool(mask_t.any().item()):
-                continue
-            mask = mask_t.detach().cpu().numpy().astype(bool)
 
-            outer_px, holes_px, _ = extract_contour_bundle(
+        rgba_by_id: dict[str, U8Arr] = {}
+        n_jobs = len(jobs)
+        n_workers = max(1, min(int(workers), n_jobs or 1))
+        if n_jobs == 0:
+            return []
+        if n_workers == 1:
+            for i, job in enumerate(jobs):
+                aid, rgba, _err = _raster_one(job)
+                if rgba is not None:
+                    rgba_by_id[aid] = rgba
+                if (i + 1) % 16 == 0 or i + 1 == n_jobs:
+                    log(f"  栅格 {i + 1}/{n_jobs}")
+        else:
+            done = 0
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = [ex.submit(_raster_one, j) for j in jobs]
+                for fut in as_completed(futs):
+                    aid, rgba, err = fut.result()
+                    done += 1
+                    if rgba is not None:
+                        rgba_by_id[aid] = rgba
+                    elif err:
+                        log(f"  跳过 {aid}: {err}")
+                    if done % 16 == 0 or done == n_jobs:
+                        log(f"  栅格 {done}/{n_jobs}")
+
+        ordered_ids = [aid for aid in ids if aid in rgba_by_id]
+        if not ordered_ids:
+            return []
+
+        sdf_iters = max(16, min(64, tex_size // 8))
+        masks_list: list[NDArray[np.bool_]] = []
+        for aid in ordered_ids:
+            a = rgba_by_id[aid][:, :, 3]
+            masks_list.append(a >= 96)
+        sdfs_by_id: dict[str, FloatArr] = {}
+        chunk = max(1, int(sdf_batch))
+        for start in range(0, len(ordered_ids), chunk):
+            batch_ids = ordered_ids[start : start + chunk]
+            batch_masks = np.stack(
+                [masks_list[start + j].astype(np.float32) for j in range(len(batch_ids))],
+                axis=0,
+            )
+            batch_sdf = batch_mask_to_sdf(batch_masks, device=dev, iters=sdf_iters)
+            for j, aid in enumerate(batch_ids):
+                sdfs_by_id[aid] = batch_sdf[j].astype(np.float32)
+            log(f"  SDF {min(start + chunk, len(ordered_ids))}/{len(ordered_ids)}")
+
+        entries: list[StampCurveEntry] = []
+        for i, asset_id in enumerate(ordered_ids):
+            mask = masks_list[i]
+            if not mask.any():
+                continue
+            outer_px, holes_px, _, area_err = fit_mask_contour_high_precision(
                 mask,
-                simplify=simplify,
+                max_area_rel_err=max_area_rel_err,
                 resample_n=resample_n,
+                use_cc_holes=True,
             )
             if len(outer_px) < 3:
-                ys, xs = torch.where(mask_t)
-                x0, x1 = float(xs.min().item()), float(xs.max().item())
-                y0, y1 = float(ys.min().item()), float(ys.max().item())
+                ys, xs = np.where(mask)
+                x0, x1 = float(xs.min()), float(xs.max())
+                y0, y1 = float(ys.min()), float(ys.max())
                 outer_px = np.array(
                     [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]],
                     dtype=np.float64,
                 )
                 holes_px = []
+                area_err = 1.0
 
-            # 弧长重采样到高密度，保证内部闭合边与复杂外轮廓精度
             outer_px = resample_closed_contour(outer_px, resample_n)
-            holes_px = [resample_closed_contour(h, resample_n) for h in holes_px if len(h) >= 3]
+            holes_px = [resample_closed_contour(h, max(48, min(resample_n, max(32, len(h))))) for h in holes_px if len(h) >= 3]
 
             outer_n = normalize_contour_to_unit(outer_px, tex_size)
             holes_n = [normalize_contour_to_unit(h, tex_size) for h in holes_px]
             desc = multi_ring_descriptor(outer_px, holes_px, bins=24)
+            sdf = sdfs_by_id.get(asset_id)
+            if sdf is None:
+                sdf = mask_to_sdf_fast(mask, device=dev, iters=sdf_iters).astype(np.float32)
 
-            # 高精度 SDF
-            sdf_iters = max(16, min(64, tex_size // 8))
-            sdf = mask_to_sdf_fast(mask, device=dev, iters=sdf_iters).astype(np.float32)
-
-            area = float(mask_t.float().mean().item())
-            ys, xs = torch.where(mask_t)
-            bw = float((xs.max() - xs.min() + 1).item())
-            bh = float((ys.max() - ys.min() + 1).item())
+            area = float(mask.mean())
+            ys, xs = np.where(mask)
+            bw = float(xs.max() - xs.min() + 1)
+            bh = float(ys.max() - ys.min() + 1)
             aspect = bw / max(bh, 1.0)
             elong = max(aspect, 1.0 / max(aspect, 1e-6))
 
@@ -211,8 +366,7 @@ class StampCurveLibrary:
             if torch.linalg.norm(closed[0] - closed[-1]) > 1e-6:
                 closed = torch.cat([closed, closed[:1]], dim=0)
             peri = float(torch.linalg.norm(closed[1:] - closed[:-1], dim=1).sum().item())
-            area_px = float(mask_t.sum().item())
-            # 孔洞面积从外轮廓面积中扣除后的填充率影响圆度
+            area_px = float(mask.sum())
             hole_a = float(sum(abs(signed_area(h)) for h in holes_px))
             solid_a = max(area_px - hole_a, 1.0)
             circ = float(4.0 * np.pi * solid_a / (peri * peri + 1e-6))
@@ -250,153 +404,117 @@ class StampCurveLibrary:
                     tags=tags,
                     n_holes=n_holes,
                     complexity=cx,
+                    contour_area_rel_err=float(area_err),
                 )
             )
-        if not entries:
-            raise RuntimeError("图章曲线库为空")
-        if cache_path is not None:
-            cls._save_cache(cache_path, entries, ids, tex_size, resample_n)
-        return cls(entries)
+            if (i + 1) % 16 == 0 or i + 1 == len(ordered_ids):
+                log(f"  轮廓 {i + 1}/{len(ordered_ids)}")
 
-    @classmethod
-    def prefit_directory(
-        cls,
-        stamps_dir: str | Path,
-        *,
-        cache_dir: str | Path | None = None,
-        tex_size: int = DEFAULT_TEX_SIZE,
-        simplify: float = DEFAULT_SIMPLIFY,
-        resample_n: int = DEFAULT_RESAMPLE_N,
-    ) -> StampCurveLibrary:
-        """强制重拟合目录下全部图章并持久化（高精度多环）。"""
-        library = StampLibrary(stamps_dir)
-        stamps_path = Path(stamps_dir)
-        cache = Path(cache_dir) if cache_dir else stamps_path.parent / ".cache" / "stamp_curves"
-        return cls.build(
-            library,
-            asset_ids=None,
-            tex_size=tex_size,
-            cache_dir=cache,
-            force_refit=True,
-            simplify=simplify,
-            resample_n=resample_n,
+        hole_n = sum(1 for e in entries if e.n_holes > 0)
+        log(f"完成：{len(entries)} 章，含孔 {hole_n}，耗时 {time.perf_counter() - t0:.1f}s，device={dev}")
+        return entries
+
+    @staticmethod
+    def _save_entry(cache_path: Path, e: StampCurveEntry) -> None:
+        """写入单个图章 npz（当前字段全集，无条件分支）。"""
+        holes_arr = np.empty(len(e.holes), dtype=object)
+        holes_px_arr = np.empty(len(e.holes_px), dtype=object)
+        for i, h in enumerate(e.holes):
+            holes_arr[i] = np.asarray(h, dtype=np.float64)
+        for i, h in enumerate(e.holes_px):
+            holes_px_arr[i] = np.asarray(h, dtype=np.float64)
+        np.savez_compressed(
+            cache_path / f"{e.asset_id}.npz",
+            contour=e.contour,
+            contour_px=e.contour_px,
+            holes=holes_arr,
+            holes_px=holes_px_arr,
+            descriptor=e.descriptor,
+            sdf=e.sdf,
+            circularity=e.circularity,
+            elongation=e.elongation,
+            area_frac=e.area_frac,
+            tex_size=e.tex_size,
+            n_holes=e.n_holes,
+            complexity=e.complexity,
+            contour_area_rel_err=e.contour_area_rel_err,
+            tags=np.array(e.tags, dtype=object),
         )
 
     @staticmethod
-    def _save_cache(
+    def _write_index(
         cache_path: Path,
-        entries: list[StampCurveEntry],
-        ids: list[str],
+        *,
+        assets: list[str],
         tex_size: int,
         resample_n: int,
+        max_area_rel_err: float,
     ) -> None:
-        cache_path.mkdir(parents=True, exist_ok=True)
+        """写入缓存索引（仅供查阅，不参与命中判定）。"""
         meta = {
-            "version": CACHE_VERSION,
             "tex_size": tex_size,
             "resample_n": resample_n,
-            "ids": ids,
-            "assets": [e.asset_id for e in entries],
-            "tags": {e.asset_id: e.tags for e in entries},
-            "n_holes": {e.asset_id: e.n_holes for e in entries},
+            "max_area_rel_err": max_area_rel_err,
+            "assets": sorted(assets),
         }
         (cache_path / "stamp_curves_meta.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        for e in entries:
-            # 孔洞打包为 object 数组
-            holes_arr = np.empty(len(e.holes), dtype=object)
-            holes_px_arr = np.empty(len(e.holes_px), dtype=object)
-            for i, h in enumerate(e.holes):
-                holes_arr[i] = np.asarray(h, dtype=np.float64)
-            for i, h in enumerate(e.holes_px):
-                holes_px_arr[i] = np.asarray(h, dtype=np.float64)
-            np.savez_compressed(
-                cache_path / f"{e.asset_id}.npz",
-                contour=e.contour,
-                contour_px=e.contour_px,
-                holes=holes_arr,
-                holes_px=holes_px_arr,
-                descriptor=e.descriptor,
-                sdf=e.sdf,
-                circularity=e.circularity,
-                elongation=e.elongation,
-                area_frac=e.area_frac,
-                tex_size=e.tex_size,
-                n_holes=e.n_holes,
-                complexity=e.complexity,
-                tags=np.array(e.tags, dtype=object),
-            )
 
     @classmethod
-    def _load_cache(cls, cache_path: Path, ids: list[str], tex_size: int) -> StampCurveLibrary:
-        """从磁盘缓存加载。"""
-        _ = tex_size
-        entries: list[StampCurveEntry] = []
-        for asset_id in ids:
-            f = cache_path / f"{asset_id}.npz"
-            if not f.is_file():
-                continue
+    def _try_load_entry(cls, cache_path: Path, asset_id: str) -> StampCurveEntry | None:
+        """
+        尝试加载单个图章缓存。
+
+        文件不存在、字段不全或读取失败 → 返回 None（视为无缓存，由调用方重算）。
+        不做字段缺省回填，不做旧格式兼容。
+        """
+        f = cache_path / f"{asset_id}.npz"
+        if not f.is_file():
+            return None
+        try:
             data = np.load(f, allow_pickle=True)
-            tags_raw = data["tags"] if "tags" in data.files else np.array([], dtype=object)
+            files = set(data.files)
+            if not all(k in files for k in _NPZ_REQUIRED_KEYS):
+                return None
+            tags_raw = data["tags"]
             tags = [str(t) for t in tags_raw.tolist()] if getattr(tags_raw, "size", 0) else []
-            holes: list[FloatArr] = []
-            holes_px: list[FloatArr] = []
-            if "holes" in data.files:
-                for h in data["holes"]:
-                    holes.append(np.asarray(h, dtype=np.float64))
-            if "holes_px" in data.files:
-                for h in data["holes_px"]:
-                    holes_px.append(np.asarray(h, dtype=np.float64))
-            n_holes = int(data["n_holes"]) if "n_holes" in data.files else len(holes)
-            circ = float(data["circularity"])
-            elong = float(data["elongation"])
-            afrac = float(data["area_frac"])
-            desc = data["descriptor"]
-            if "complexity" in data.files:
-                cplx = float(data["complexity"])
-            else:
-                cplx = geometric_complexity(
-                    circularity=circ,
-                    elongation=elong,
-                    n_holes=n_holes,
-                    descriptor=desc,
-                    area_frac=afrac,
-                )
-            entries.append(
-                StampCurveEntry(
-                    asset_id=asset_id,
-                    contour=data["contour"],
-                    contour_px=data["contour_px"],
-                    holes=holes,
-                    holes_px=holes_px,
-                    descriptor=desc,
-                    sdf=data["sdf"],
-                    tex_size=int(data["tex_size"]),
-                    circularity=circ,
-                    elongation=elong,
-                    area_frac=afrac,
-                    tags=tags,
-                    n_holes=n_holes,
-                    complexity=cplx,
-                )
+            holes: list[FloatArr] = [np.asarray(h, dtype=np.float64) for h in data["holes"]]
+            holes_px: list[FloatArr] = [np.asarray(h, dtype=np.float64) for h in data["holes_px"]]
+            return StampCurveEntry(
+                asset_id=asset_id,
+                contour=np.asarray(data["contour"], dtype=np.float64),
+                contour_px=np.asarray(data["contour_px"], dtype=np.float64),
+                holes=holes,
+                holes_px=holes_px,
+                descriptor=np.asarray(data["descriptor"], dtype=np.float64),
+                sdf=np.asarray(data["sdf"], dtype=np.float32),
+                tex_size=int(data["tex_size"]),
+                circularity=float(data["circularity"]),
+                elongation=float(data["elongation"]),
+                area_frac=float(data["area_frac"]),
+                tags=tags,
+                n_holes=int(data["n_holes"]),
+                complexity=float(data["complexity"]),
+                contour_area_rel_err=float(data["contour_area_rel_err"]),
             )
-        if not entries:
-            raise RuntimeError("缓存曲线库为空")
-        return cls(entries)
+        except Exception:
+            return None
 
     def recall(
         self,
         block_descriptor: FloatArr,
-        circularity: float = 1.0,
-        elongation: float = 1.0,
-        k: int = 48,
+        circularity: float,
+        elongation: float,
+        k: int = 32,
         *,
-        tag_boost: set[str] | None = None,
         prefer_holes: bool | None = None,
+        tag_boost: set[str] | None = None,
         region_simplicity: float | None = None,
-        region_area_frac: float = 0.1,
+        region_area_frac: float = 0.0,
+        max_complexity: float | None = None,
+        min_fill: float = 0.0,
     ) -> list[str]:
         """
         描述子 top-k 召回（全库，无形状桶、无场景名）。
@@ -409,6 +527,10 @@ class StampCurveLibrary:
         desc = np.asarray(block_descriptor, dtype=np.float64)
         r_simp = 0.5 if region_simplicity is None else float(np.clip(region_simplicity, 0.0, 1.0))
         for e in self.entries:
+            if max_complexity is not None and e.complexity > max_complexity:
+                continue
+            if e.area_frac < min_fill:
+                continue
             ed = np.asarray(e.descriptor, dtype=np.float64)
             n = min(len(ed), len(desc))
             d = float(np.linalg.norm(ed[:n] - desc[:n]))
@@ -445,7 +567,7 @@ class StampCurveLibrary:
         return [e.asset_id for e in self.entries if want.intersection(e.tags)]
 
     def all_rings_normalized(self, asset_id: str) -> list[FloatArr]:
-        """主外轮廓 + 全部孔洞（归一化坐标）。"""
+        """主外轮廓 + 全部闭合内环/附加环（归一化坐标）。"""
         e = self.by_id[asset_id]
         return [e.contour, *e.holes]
 
@@ -462,12 +584,7 @@ class StampCurveLibrary:
         n: int = 128,
         include_holes: bool = True,
     ) -> FloatArr:
-        """
-        将图章轮廓（可选含孔）变换到画布坐标。
-
-        多环时拼接为 (M,2)，孔与外轮廓之间不插值连接点由调用方分环处理更佳；
-        此处提供合并点云供 Chamfer。
-        """
+        """将图章轮廓（可选含孔）变换到画布坐标。多环拼接供 Chamfer。"""
         rings = self.all_rings_normalized(asset_id) if include_holes else [self.by_id[asset_id].contour]
         chunks: list[FloatArr] = []
         th = np.deg2rad(angle_deg)

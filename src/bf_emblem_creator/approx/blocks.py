@@ -1,4 +1,4 @@
-"""大块光滑色块概括（v2）：少色、合并碎岛、轮廓曲线。"""
+"""大块光滑色块概括：基于平面化标签场提取区域轮廓。"""
 
 from __future__ import annotations
 
@@ -16,15 +16,9 @@ from bf_emblem_creator.approx.curves import (
     mask_to_sdf,
     resample_closed_contour,
 )
-from bf_emblem_creator.approx.models import AbstractionMode, ApproxConfig, ApproxMeta
-from bf_emblem_creator.approx.preprocess import (
-    bilateral_smooth,
-    detect_mode,
-    detect_resample_mode,
-    estimate_alpha,
-    fit_to_canvas,
-    quantize_lab,
-)
+from bf_emblem_creator.approx.models import AbstractionMode
+from bf_emblem_creator.approx.planarize import planarize_image
+from bf_emblem_creator.approx.recipe import ModeRecipe, default_recipe_for_mode
 
 U8Arr = NDArray[np.uint8]
 FloatArr = NDArray[np.floating]
@@ -49,16 +43,16 @@ class ColorBlock(BaseModel):
 
 
 class BlockTarget(BaseModel):
-    """v2 拟合目标：大块列表 + 栅格图。"""
+    """拟合目标：大块列表 + 栅格图。"""
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    image_rgb: Any
-    alpha: Any
-    weight: Any
-    blocks: list[ColorBlock]
-    meta: ApproxMeta
-    canvas_size: int = 320
+    image_rgb: Any = Field(..., description="RGB uint8")
+    alpha: Any = Field(..., description="alpha float")
+    weight: Any = Field(..., description="权重 float")
+    blocks: list[ColorBlock] = Field(default_factory=list, description="色块列表")
+    meta: Any = Field(..., description="ApproxMeta")
+    canvas_size: int = Field(default=320, description="画布边长")
 
     def numpy_rgb(self) -> U8Arr:
         return np.asarray(self.image_rgb, dtype=np.uint8)
@@ -112,53 +106,23 @@ def _label_ccs(binary: BoolArr) -> list[BoolArr]:
 
 def abstract_to_blocks(
     image: Image.Image | str | Path | U8Arr,
-    config: ApproxConfig | None = None,
+    recipe: ModeRecipe | None = None,
     *,
     max_blocks: int = 16,
     min_area_frac: float = 0.008,
 ) -> BlockTarget:
     """
-    v2 概括：少色大块 + 轮廓曲线。
+    严格色量平面化后提取大块 + 轮廓。
 
-    碎岛被合并/丢弃，边界经形态学与 RDP 光滑。
+    使用 recipe.image.num_colors；碎岛经形态学与面积门槛丢弃。
     """
-    cfg = config or ApproxConfig()
-    if isinstance(image, Image.Image):
-        rgba_img = image.convert("RGBA")
-    elif isinstance(image, (str, Path)):
-        rgba_img = Image.open(image).convert("RGBA")
-    else:
-        arr = np.asarray(image)
-        if arr.ndim == 2:
-            rgba_img = Image.fromarray(arr, mode="L").convert("RGBA")
-        elif arr.shape[-1] == 3:
-            rgba_img = Image.fromarray(arr.astype(np.uint8), mode="RGB").convert("RGBA")
-        else:
-            rgba_img = Image.fromarray(arr.astype(np.uint8), mode="RGBA")
-
-    mode = detect_mode(rgba_img) if cfg.mode == AbstractionMode.auto else cfg.mode
-    fit = "cover" if mode.value.startswith("photo") else "contain"
-    r_mode, _ = detect_resample_mode(rgba_img, target_size=cfg.canvas_size, configured=cfg.resample_mode)
-    rgba, meta = fit_to_canvas(rgba_img, cfg.canvas_size, how=fit, resample=r_mode)
-    meta = meta.model_copy(update={"mode": mode})
-    alpha = estimate_alpha(rgba, mode)
-    rgb = rgba[:, :, :3]
-    hard_edge = meta.resample == "nearest" and meta.approx_color_count <= 48
-    if hard_edge:
-        pass
-    elif cfg.bilateral and mode != AbstractionMode.logo:
-        rgb = bilateral_smooth(rgb, strength="strong" if mode.value.startswith("photo") else "medium")
-
-    # 更少色、更大块
-    k = min(cfg.palette_k, 5)
-    labels, palette = quantize_lab(rgb, alpha, k, seed=cfg.seed)
+    r = recipe if recipe is not None else default_recipe_for_mode(AbstractionMode.illustration)
+    labels, palette, alpha, image_q, meta, _src = planarize_image(image, r.image, mode=r.mode)
     h, w = labels.shape
     canvas_area = float(h * w)
     min_area = min_area_frac * canvas_area
 
     blocks: list[ColorBlock] = []
-    image_q = np.zeros((h, w, 3), dtype=np.uint8)
-
     for i, pal in enumerate(palette):
         base = (labels == i) & (alpha >= 0.5)
         if not base.any():
@@ -168,9 +132,8 @@ def abstract_to_blocks(
             area = float(cc.sum())
             if area < min_area:
                 continue
-            contour = extract_outer_contour(cc, simplify=0.6)
+            contour = extract_outer_contour(cc, simplify=0.0)
             if contour is None or len(contour) < 3:
-                # 兜底：用 bbox 矩形轮廓，避免丢大块
                 ys, xs = np.where(cc)
                 x0, x1 = int(xs.min()), int(xs.max())
                 y0, y1 = int(ys.min()), int(ys.max())
@@ -199,13 +162,11 @@ def abstract_to_blocks(
             )
             image_q[cc] = np.array(pal.rgb, dtype=np.uint8)
 
-    # 按面积从大到小 → 底层优先
     blocks.sort(key=lambda b: -b.area_frac)
     for i, b in enumerate(blocks[:max_blocks]):
         b.depth_hint = i
     blocks = blocks[:max_blocks]
 
-    # 权重：边缘 + alpha
     gray = image_q.astype(np.float64).mean(axis=2) / 255.0
     edge = np.zeros_like(gray)
     edge[:, :-1] = np.maximum(edge[:, :-1], np.abs(gray[:, 1:] - gray[:, :-1]))
@@ -221,5 +182,5 @@ def abstract_to_blocks(
         weight=weight.astype(np.float64),
         blocks=blocks,
         meta=meta,
-        canvas_size=cfg.canvas_size,
+        canvas_size=r.image.canvas_size,
     )

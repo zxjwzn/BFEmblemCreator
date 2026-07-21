@@ -1,21 +1,23 @@
-"""approx 兼容测试（v3 路径）。"""
+"""approx 管线冒烟测试。"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from bf_emblem_creator.approx.blocks import abstract_to_blocks
-from bf_emblem_creator.approx.models import ApproxConfig
+from bf_emblem_creator.approx.models import AbstractionMode
+from bf_emblem_creator.approx.recipe import default_recipe_for_mode
 from bf_emblem_creator.approx.stamp_curves import StampCurveLibrary
 from bf_emblem_creator.stamps import StampLibrary
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMPS = ROOT / "assets" / "stamps"
-EMOJI_SMILE = ROOT / "examples" / "😄.png"
+EMOJI_SMILE = ROOT / "examples" / "smile.png"
 
 
 def test_abstract_blocks_still_works() -> None:
-    target = abstract_to_blocks(EMOJI_SMILE, ApproxConfig(stamps_dir=STAMPS, palette_k=4))
+    recipe = default_recipe_for_mode(AbstractionMode.illustration).override(stamps_dir=STAMPS, num_colors=4)
+    target = abstract_to_blocks(EMOJI_SMILE, recipe)
     assert len(target.blocks) >= 1
 
 

@@ -12,17 +12,19 @@ from bf_emblem_creator.approx.contour_arcs import ArcPrimitive, PrimitiveType
 from bf_emblem_creator.approx.debug_vis import (
     DebugVisualizer,
     stamp_layer_curve_on_canvas,
+    stamp_layer_rings_on_canvas,
 )
 from bf_emblem_creator.approx.depth_order import EdgeRole, OrderedRegion
 from bf_emblem_creator.approx.match_curve import transform_stamp_contour_batch
-from bf_emblem_creator.approx.models import ApproxConfig
+from bf_emblem_creator.approx.models import AbstractionMode
 from bf_emblem_creator.approx.pipeline import approximate_image
+from bf_emblem_creator.approx.recipe import default_recipe_for_mode
 from bf_emblem_creator.approx.regions import Region
 from bf_emblem_creator.models import StampLayer
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMPS = ROOT / "assets" / "stamps"
-EMOJI = ROOT / "examples" / "😄.png"
+EMOJI = ROOT / "examples" / "smile.png"
 
 
 def _make_region(mask: np.ndarray) -> Region:
@@ -67,6 +69,68 @@ def test_stamp_layer_curve_matches_torch_batch() -> None:
     assert np.allclose(np_xy, batch, atol=1e-4)
 
 
+def test_stamp_layer_rings_include_holes() -> None:
+    """多环变换：外环 + 内孔均变换到画布。"""
+    t = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+    outer = np.stack([0.5 * np.cos(t), 0.5 * np.sin(t)], axis=1)
+    hole = np.stack([0.2 * np.cos(t), 0.2 * np.sin(t)], axis=1)
+    rings = stamp_layer_rings_on_canvas(
+        [outer, hole],
+        left=100.0,
+        top=100.0,
+        width=80.0,
+        height=80.0,
+        angle_deg=0.0,
+    )
+    assert len(rings) == 2
+    # 外环半径约 40，内孔约 16，中心在 (100,100)
+    assert float(np.mean(np.linalg.norm(rings[0] - np.array([100.0, 100.0]), axis=1))) > 30.0
+    assert float(np.mean(np.linalg.norm(rings[1] - np.array([100.0, 100.0]), axis=1))) < 25.0
+
+
+def test_save_accepted_match_draws_multi_rings(tmp_path: Path) -> None:
+    """匹配调试图接受外轮廓+孔环列表。"""
+    dbg = DebugVisualizer(tmp_path)
+    rgb = np.full((64, 64, 3), 40, dtype=np.uint8)
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[10:50, 10:50] = True
+    reg = _make_region(mask)
+    layer = StampLayer(
+        asset="OpenCircle",
+        left=32.0,
+        top=32.0,
+        width=40.0,
+        height=40.0,
+        angle=0.0,
+        fill="#FFCC00",
+    )
+    t = np.linspace(0, 2 * np.pi, 20, endpoint=False)
+    outer = stamp_layer_curve_on_canvas(
+        np.stack([0.5 * np.cos(t), 0.5 * np.sin(t)], axis=1),
+        left=32,
+        top=32,
+        width=40,
+        height=40,
+        angle_deg=0,
+    )
+    hole = stamp_layer_curve_on_canvas(
+        np.stack([0.2 * np.cos(t), 0.2 * np.sin(t)], axis=1),
+        left=32,
+        top=32,
+        width=40,
+        height=40,
+        angle_deg=0,
+    )
+    dbg.save_accepted_match(
+        base_rgb=rgb,
+        region=reg,
+        layer=layer,
+        stamp_curve_canvas=[outer, hole],
+        layer_index=0,
+    )
+    assert any("match_ok" in p.name for p in dbg.saved)
+
+
 def test_debug_visualizer_disabled_writes_nothing(tmp_path: Path) -> None:
     """debug_dir=None 时不写盘。"""
     dbg = DebugVisualizer(None)
@@ -95,10 +159,10 @@ def test_debug_visualizer_stages_and_accepted_only(tmp_path: Path) -> None:
     dbg.save_contours(rgb, [reg])
     dbg.save_depth_order(rgb, [OrderedRegion(region=reg, depth=0, boundary_role_default=EdgeRole.shape_boundary)])
     prim = ArcPrimitive(
-        type=PrimitiveType.circle_arc,
-        params={"cx": 25.0, "cy": 25.0, "r": 12.0},
+        type=PrimitiveType.free,
+        params={},
         sample_points=reg.contour,
-        hard=False,
+        hard=True,
         region_id=0,
         depth=0,
     )
@@ -140,27 +204,22 @@ def test_approximate_with_debug_dir(tmp_path: Path) -> None:
     """管线启用 debug_dir 时写出主阶段图，且匹配图仅有 accepted。"""
     subset = ["Circle", "Square", "OpenCircle", "HalfCircle", "Line", "Triangle"]
     out_dbg = tmp_path / "dbg"
-    cfg = ApproxConfig(
+    recipe = default_recipe_for_mode(AbstractionMode.illustration).override(
         stamps_dir=STAMPS,
         max_layers=8,
-        palette_k=4,
-        k_start=4,
-        k_max=6,
-        k_max_iters=2,
-        delta_k=2,
-        n_margin=4,
-        coarse_max_regions=5,
+        num_colors=4,
+        max_faces=8,
         pass_score=0.2,
-        recall_k=6,
+        asset_allowlist=subset,
+        enable_special_fx=False,
         refine=False,
         seed=0,
-        stamp_subset=subset,
-        enable_special_fx=False,
-        prefer_primitive_seed=True,
         debug_dir=out_dbg,
         n_particles=48,
+        use_cuda=torch.cuda.is_available(),
     )
-    result = approximate_image(EMOJI, cfg, n_particles=48, use_cuda=torch.cuda.is_available())
+    recipe = recipe.model_copy(update={"match": recipe.match.model_copy(update={"recall_k": 6, "prefer_primitive_seed": True})})
+    result = approximate_image(EMOJI, recipe, n_particles=48)
     assert out_dbg.is_dir()
     pngs = list(out_dbg.rglob("*.png"))
     assert len(pngs) >= 4

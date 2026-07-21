@@ -129,7 +129,7 @@ class EmblemDocument(RootModel[list[StampLayer]]):
         )
 
     def model_dump_list(self) -> list[dict[str, Any]]:
-        """导出为图层字典列表（JSON 兼容）。"""
+        """导出为图层字典列表。"""
         dumped = self.model_dump(mode="json")
         if not isinstance(dumped, list):
             raise TypeError("EmblemDocument 的 dump 结果必须是 list")

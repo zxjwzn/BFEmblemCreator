@@ -1,4 +1,4 @@
-"""由简入繁 / 弧基元主路径相关单元测试。"""
+"""层预算工具与图章匹配冒烟（ModeRecipe）。"""
 
 from __future__ import annotations
 
@@ -8,37 +8,17 @@ import numpy as np
 import pytest
 import torch
 
-from bf_emblem_creator.approx.budget_loop import BudgetState, initial_k, is_coarse_phase, next_k
 from bf_emblem_creator.approx.contour_arcs import PrimitiveType, fit_segment_primitive
 from bf_emblem_creator.approx.match_curve import low_complexity_assets, region_simplicity
-from bf_emblem_creator.approx.models import ApproxConfig
+from bf_emblem_creator.approx.models import AbstractionMode
 from bf_emblem_creator.approx.pipeline import approximate_image
+from bf_emblem_creator.approx.recipe import default_recipe_for_mode
 from bf_emblem_creator.approx.stamp_curves import StampCurveLibrary, geometric_complexity
 from bf_emblem_creator.stamps import StampLibrary
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMPS = ROOT / "assets" / "stamps"
-EMOJI = ROOT / "examples" / "😄.png"
-
-
-def test_initial_k_is_coarse_not_max() -> None:
-    """由简入繁：起始 K 取小者。"""
-    cfg = ApproxConfig(k_start=4, palette_k=10, k_max=12)
-    assert initial_k(cfg) == 4
-    assert is_coarse_phase(4, cfg)
-    assert is_coarse_phase(6, cfg)
-    assert not is_coarse_phase(10, cfg)
-
-
-def test_next_k_requires_layer_budget() -> None:
-    """层已接近上限时不再涨 K。"""
-    cfg = ApproxConfig(k_start=4, delta_k=2, k_max=12, k_max_iters=4, n_margin=6, max_layers=40, pass_score=0.48)
-    st = BudgetState(k=4, iteration=1, n_layers=5, score=0.2)
-    assert next_k(st, cfg) == 6
-    st_full = BudgetState(k=4, iteration=1, n_layers=36, score=0.2)
-    assert next_k(st_full, cfg) is None
-    st_pass = BudgetState(k=4, iteration=1, n_layers=5, score=0.9)
-    assert next_k(st_pass, cfg) is None
+EMOJI = ROOT / "examples" / "smile.png"
 
 
 def test_region_simplicity_high_for_disk() -> None:
@@ -56,18 +36,19 @@ def test_geometric_complexity_low_for_solid_disk() -> None:
     assert c2 > c
 
 
-def test_circle_arc_primitive_fits_disk_contour() -> None:
+def test_exact_free_primitive_for_disk_contour() -> None:
+    """圆轮廓在精确描边路径下为 free hard，不替换为圆基元。"""
     t = np.linspace(0, 2 * np.pi, 80, endpoint=False)
     circle = np.stack([80 + 40 * np.cos(t), 80 + 40 * np.sin(t)], axis=1)
     circle = np.vstack([circle, circle[:1]])
     ptype, params, res, hard = fit_segment_primitive(circle, eps_arc=0.06)
-    assert ptype in {PrimitiveType.circle_arc, PrimitiveType.ellipse_arc}
-    assert res < 0.08
-    assert not hard
-    assert "r" in params or "a" in params
+    assert ptype == PrimitiveType.free
+    assert hard
+    assert res == 0.0
+    assert params == {}
 
 
-def test_low_complexity_assets_prefer_simple() -> None:
+def test_low_complexity_assets_exist() -> None:
     lib = StampLibrary(STAMPS)
     curves = StampCurveLibrary.build(
         lib,
@@ -82,33 +63,26 @@ def test_low_complexity_assets_prefer_simple() -> None:
 
 
 @pytest.mark.timeout(240)
-def test_approximate_coarse_to_fine_smoke() -> None:
-    """由简入繁路径：小 K 起步，能产出层与预览。"""
+def test_approximate_num_colors_smoke() -> None:
+    """严格 num_colors 路径：能产出层与预览。"""
     subset = ["Circle", "Square", "OpenCircle", "Drop", "HalfCircle", "Triangle", "Line", "Banner"]
-    cfg = ApproxConfig(
+    recipe = default_recipe_for_mode(AbstractionMode.illustration).override(
         stamps_dir=STAMPS,
-        max_layers=12,
-        palette_k=4,
-        k_start=4,
-        k_max=8,
-        k_max_iters=2,
-        delta_k=2,
-        n_margin=4,
-        coarse_max_regions=6,
+        max_layers=40,
+        num_colors=4,
+        max_faces=12,
         pass_score=0.2,
-        recall_k=8,
-        refine=True,
-        refine_iters=1,
-        seed=0,
-        stamp_subset=subset,
+        asset_allowlist=subset,
         enable_special_fx=False,
-        prefer_primitive_seed=True,
+        refine=True,
+        seed=0,
+        use_cuda=torch.cuda.is_available(),
+        n_particles=64,
     )
-    result = approximate_image(EMOJI, cfg, n_particles=64, use_cuda=torch.cuda.is_available())
+    recipe = recipe.model_copy(
+        update={"match": recipe.match.model_copy(update={"recall_k": 8, "refine_iters": 1, "prefer_primitive_seed": True})}
+    )
+    result = approximate_image(EMOJI, recipe, n_particles=64)
     assert len(result.document) >= 1
-    assert len(result.document) <= 12
-    assert result.k_used >= 4
-    assert result.preview_rgb is not None
-    assert result.log_lines
-    # 粗阶段日志应存在
-    assert any("K=4" in line or "K=6" in line or "K=8" in line for line in result.log_lines)
+    assert len(result.document) <= 40
+    assert result.k_used == 4

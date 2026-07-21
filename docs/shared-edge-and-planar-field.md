@@ -1,7 +1,7 @@
-# 算法 v3 补篇：通用标签场概括 + 共享边缘拓扑
+# 标签场与共享边：通用标签场概括 + 共享边缘拓扑
 
-> 状态：设计稿 v0.3（**文档设计点已落地**：Batch A–E，含 halfedge 环、亚像素边 D1、匹配按 edge_id 去重目标曲线）  
-> 父文档：[`algorithm-v3-visible-boundary-fitting.md`](./algorithm-v3-visible-boundary-fitting.md)  
+> 状态：**文档设计点已落地**（阶段 A–E：halfedge 环、亚像素边、匹配按 edge_id 去重目标曲线）  
+> 父文档：[`visible-boundary-fitting.md`](./visible-boundary-fitting.md)  
 > 相关问题：`source_fitted` 阶段即出现软边杂色、色块裂纹、区域拼合细缝；独立轮廓拟合会双侧内缩  
 > 约束：通用方案，**禁止**场景白名单 / 形状路由；画布默认 320×320；层数 ≤40；注释与文档中文  
 > 代码：`preprocess.detect_resample_mode` / `label_field.py` / `planar_map.py`（halfedge 环 + `refine_edges_subpixel`）/ `contour_arcs.extract_primitives_for_shared_edges` / `match_curve.target_curve_pts` / `assemble.seam_p95`；测试 `tests/test_shared_edge_label_field.py`
@@ -37,29 +37,29 @@
   │
   ▼
 ┌─────────────────────────────────────┐
-│ Batch A  自适应画布对齐（少造软边）   │
+│ 阶段 A  自适应画布对齐（少造软边）   │
 └──────────────────┬──────────────────┘
                    ▼
 ┌─────────────────────────────────────┐
-│ Batch B  通用标签场概括              │
+│ 阶段 B  通用标签场概括              │
 │  调色板 → 空间正则分配 → 无洞规整    │
 └──────────────────┬──────────────────┘
                    ▼
 ┌─────────────────────────────────────┐
-│ Batch C  共享边缘拓扑（平面图）       │
+│ 阶段 C  共享边缘拓扑（平面图）       │
 │  Vertex / HalfEdge / Face            │
 └──────────────────┬──────────────────┘
                    ▼
 ┌─────────────────────────────────────┐
-│ Batch D  边上高精度曲线拟合           │
+│ 阶段 D  边上高精度曲线拟合           │
 └──────────────────┬──────────────────┘
                    ▼
 ┌─────────────────────────────────────┐
-│ Batch E  匹配 / 层序 / 装配缝宽复检   │
+│ 阶段 E  匹配 / 层序 / 装配缝宽复检   │
 │  （接入现有 P3–P9）                  │
 └──────────────────┬──────────────────┘
                    ▼
-         与 v3 主循环汇合 → JSON + 预览
+         与主循环汇合 → JSON + 预览
 ```
 
 ### 0.4 非目标
@@ -69,14 +69,14 @@
 - 不追求照片级纹理 PSNR  
 - 不在标签场仍有空洞时「只靠 SharedEdge 假装无缝」
 
-### 0.5 与 v3 主文档章节映射
+### 0.5 与主文档章节映射
 
-| 本补篇 | v3 主文档 |
+| 本补篇 | 主文档 |
 |--------|-----------|
-| Batch A–B | §3.1 平面化 P1、§3.2 区域 P2 |
-| Batch C | §3.2 邻接图升级为几何邻接 |
-| Batch D | §4 轮廓分段与弧逼近 P4 |
-| Batch E | §3.3 层序、§6 曲线匹配、§8 装配 |
+| 阶段 A–B | §3.1 平面化 P1、§3.2 区域 P2 |
+| 阶段 C | §3.2 邻接图升级为几何邻接 |
+| 阶段 D | §4 轮廓分段与弧逼近 P4 |
+| 阶段 E | §3.3 层序、§6 曲线匹配、§8 装配 |
 | 验收 | §10 评分 + 新增标签场硬指标 |
 
 ---
@@ -94,11 +94,11 @@
 | **主体** | \(\alpha \ge 0.5\) 的像素集合 |
 | **gap** | 主体内未归属任何 Face 的像素；**目标恒为 0** |
 | **细丝** | 宽度约 1、面积很小的连通标签噪声 |
-| **SHAPE_BOUNDARY / OCCLUSION_CUT** | 与 v3 相同：真形状边 / 上层遮挡假边 |
+| **SHAPE_BOUNDARY / OCCLUSION_CUT** | 相同：真形状边 / 上层遮挡假边 |
 
 ---
 
-## 2. Batch A — 自适应画布对齐（少造软边）
+## 2. 阶段 A — 自适应画布对齐（少造软边）
 
 > **目标**：在通用前提下减少「硬边被插值成斜坡」。  
 > **原则**：用可测信号选重采样，**不用**场景枚举名做唯一开关。
@@ -128,7 +128,7 @@
 |------------------|------------|------|
 | \(N_{\mathrm{col}}\le 24\) 且尖峰明显 | `nearest` | 平面色 / 像素风自动命中 |
 | 可整数倍放大且 \(N_{\mathrm{col}}\le 48\) | `nearest` 按整数倍再 pad | 相位对齐 |
-| 色多、梯度平滑、像照片 | `lanczos` / `bicubic` | 后续靠 Batch B 收边 |
+| 色多、梯度平滑、像照片 | `lanczos` / `bicubic` | 后续靠 阶段 B 收边 |
 | 默认兜底 | `bilinear` 或弱 `lanczos` | 避免极端锯齿 |
 
 > 实现时阈值放进 `ApproxConfig`，禁止写死「gold/emoji」文件名。
@@ -165,7 +165,7 @@
 
 ---
 
-## 3. Batch B — 通用标签场概括（减杂色 / 错区 / 空洞）
+## 3. 阶段 B — 通用标签场概括（减杂色 / 错区 / 空洞）
 
 > **目标**：输出 **无洞、少细丝、边界可解释** 的 \(L\) 与调色板。  
 > **这是质量上限的主战场。**
@@ -279,11 +279,10 @@ E(L)=\sum_p D(p,L_p)+\lambda\sum_{(p,q)\in\mathcal{N}} [L_p\neq L_q]\, w_{pq}
 | 字段 | 含义 | 建议默认 |
 |------|------|----------|
 | `resample_mode` | `auto\|nearest\|lanczos\|bilinear` | `auto` |
-| `flat_grad_q` | 平坦区梯度分位阈值 | 0.35～0.5 |
+| `num_colors` | 严格 LAB k-means 色数 K | 6 |
 | `mrf_lambda` | 空间正则强度 | 1.0～3.0 |
 | `mrf_iters` | ICM 轮数 | 5 |
 | `min_region_area_frac` | 最小 Face 面积 | 现有 0.004 可保留 |
-| `lab_merge` | 近色合并 ΔE | 8～12 |
 | `enforce_no_gap` | 强制无洞 | `true` |
 
 ### 3.9 本批交付与验收
@@ -309,18 +308,18 @@ noise_frac <= ε
 - SharedEdge 几何  
 - 改匹配粒子逻辑  
 
-### 3.10 与「多级 K 预算环」的关系
+### 3.10 与色量的关系
 
-- 外环仍可 `K = k_start … k_max`（v3 §9）  
-- **每一档 K 的单次平面化都必须满足无洞**  
-- 加密 K 时优先 split **高残差 Face**，而不是全局乱加中心导致碎丝  
+- 平面化严格按配置 `num_colors` 做 LAB k-means（不做近色/阴影软合并）  
+- 单次平面化必须满足主体内无洞  
+- 过小连通域并入邻域，不丢洞、不引入第三色长丝  
 
 ---
 
-## 4. Batch C — 共享边缘拓扑（平面图）
+## 4. 阶段 C — 共享边缘拓扑（平面图）
 
 > **目标**：从无洞标签场建立 **Vertex / SharedEdge / Face**，保证相邻 Face **共边几何唯一**。  
-> **前置**：Batch B 的 `gap_frac=0`。
+> **前置**：阶段 B 的 `gap_frac=0`。
 
 ### 4.1 数据模型（设计）
 
@@ -383,7 +382,7 @@ C6  校验：每个 Face 环闭合；半边双射；无悬边
 **坐标约定（需写死一种）**
 
 - MVP：像素边界（整数格线）或像素中心链，二选一；文档与实现一致  
-- 后续 Batch D 再升亚像素，但 **拓扑 id 不变**，只更新 `polyline` 点值  
+- 后续 阶段 D 再升亚像素，但 **拓扑 id 不变**，只更新 `polyline` 点值  
 
 ### 4.3 与现有 `Region` / `AdjacencyEdge` 的迁移
 
@@ -395,7 +394,7 @@ C6  校验：每个 Face 环闭合；半边双射；无悬边
 | `RegionGraph` | 升级为 `PlanarMap`（或内嵌 `edges: list[SharedEdge]`） |
 | `depth_order.edge_roles` | `role` 写回 `SharedEdge.role` |
 
-兼容策略：
+迁移策略：
 
 1. 先实现 `PlanarMap` + `to_region_graph()` 适配层，pipeline 逐步切  
 2. 禁止长期双写两套可分歧轮廓  
@@ -405,8 +404,8 @@ C6  校验：每个 Face 环闭合；半边双射；无悬边
 | 操作 | 规则 |
 |------|------|
 | RDP | **按 SharedEdge 做**；**端点 Vertex 锁死** |
-| 面积缩放 | **禁止**单 Face 独立缩放轮廓；若需要，用法向联动或整体优化（Batch D） |
-| 形态学 | 优先在标签场做完（Batch B）；拓扑建立后少做会改连通性的栅格运算 |
+| 面积缩放 | **禁止**单 Face 独立缩放轮廓；若需要，用法向联动或整体优化（阶段 D） |
+| 形态学 | 优先在标签场做完（阶段 B）；拓扑建立后少做会改连通性的栅格运算 |
 | 删边 | 仅当两 Face 合并时；同步改 halfedge |
 
 ### 4.5 本批交付与验收
@@ -434,10 +433,10 @@ C6  校验：每个 Face 环闭合；半边双射；无悬边
 
 ---
 
-## 5. Batch D — 边上高精度曲线拟合
+## 5. 阶段 D — 边上高精度曲线拟合
 
 > **目标**：在 SharedEdge 上做 line / circle_arc / ellipse_arc / free，服务可见边界匹配。  
-> **前置**：Batch C 拓扑稳定。
+> **前置**：阶段 C 拓扑稳定。
 
 ### 5.1 拟合对象
 
@@ -451,7 +450,7 @@ D1  边采样加密（弧长均匀）
 D2  亚像素调整（可选）：沿法向对齐标签 SDF / 原图梯度峰
 D3  分段：曲率极值、转角阈值、角色变化、结点处强制切分
 D4  每段 fit：line / circle / ellipse；残差 > ε → HARD/free 密采样
-D5  有损策略：与 v3 §4.3 一致，但残差相对边长定义
+D5  有损策略：与 §4.3 一致，但残差相对边长定义
 D6  写回：更新 EdgeChain 的 analytic 参数 + sample_points；锁 Vertex
 ```
 
@@ -501,15 +500,15 @@ ArcPrimitive {
 
 ---
 
-## 6. Batch E — 层序、匹配与装配缝宽复检
+## 6. 阶段 E — 层序、匹配与装配缝宽复检
 
-> **目标**：把 SharedEdge 接入 v3 的 P3 / P6 / P8，闭合「可见边界」回路。
+> **目标**：把 SharedEdge 接入层序 / 曲线匹配 / 装配，闭合「可见边界」回路。
 
 ### 6.1 层序 π（P3）
 
 - 输入改为 `PlanarMap` + 现有面积/包围启发式  
 - 对每条 **两 Face 之间** 的 SharedEdge 标 `SHAPE_BOUNDARY` 或 `OCCLUSION_CUT`  
-- 规则与 v3 §3.3 一致；结果写 `SharedEdge.role`  
+- 规则与 §3.3 一致；结果写 `SharedEdge.role`  
 
 ### 6.2 曲线匹配（P6）
 
@@ -575,7 +574,7 @@ ArcPrimitive {
 ## 7. 批次依赖与建议工期节奏
 
 ```text
-Batch A ──► Batch B ──► Batch C ──► Batch D ──► Batch E
+阶段 A ──► 阶段 B ──► 阶段 C ──► 阶段 D ──► 阶段 E
               │                        │
               └──── 可与文档/调试图并行 ┘
 ```
@@ -601,13 +600,13 @@ Batch A ──► Batch B ──► Batch C ──► Batch D ──► Batch E
 
 | 模块 | 职责 |
 |------|------|
-| `preprocess.py` | Batch A：`detect_resample_mode`、`fit_to_canvas` 多模式 |
-| `planarize.py` 或 `label_field.py` | Batch B：调色板、MRF、无洞 |
+| `preprocess.py` | 阶段 A：`detect_resample_mode`、`fit_to_canvas` 多模式 |
+| `planarize.py` 或 `label_field.py` | 阶段 B：调色板、MRF、无洞 |
 | `regions.py` | 过渡期：无洞 CC；最终变薄为 Face 适配 |
-| `planar_map.py`（新） | Batch C：SharedEdge 拓扑 |
-| `contour_arcs.py` | Batch D：边上基元 |
-| `depth_order.py` | Batch E：角色写回边 |
-| `match_curve.py` | Batch E：边聚合损失 |
+| `planar_map.py`（新） | 阶段 C：SharedEdge 拓扑 |
+| `contour_arcs.py` | 阶段 D：边上基元 |
+| `depth_order.py` | 阶段 E：角色写回边 |
+| `match_curve.py` | 阶段 E：边聚合损失 |
 | `assemble.py` / `metrics.py` | 缝宽与否决 |
 | `debug_vis.py` | gap / shared edges / seam 可视化 |
 | `models.ApproxConfig` | 新配置项 |
@@ -617,24 +616,24 @@ Batch A ──► Batch B ──► Batch C ──► Batch D ──► Batch E
 
 ## 9. 测试计划（分批）
 
-### 9.1 Batch A
+### 9.1 阶段 A
 
 - 合成 8 色像素块放大：auto → nearest，色数不爆炸  
 - 平滑渐变图：auto 不强制 nearest  
 
-### 9.2 Batch B
+### 9.2 阶段 B
 
 - 硬边两色：gap=0，边界 4-邻接干净  
 - 软边条带（中间 lerp）：最终标签只有 2 色（或配置允许的 K），无长丝第三色  
 - 随机细丝噪声：规整后 noise_frac 达标  
 
-### 9.3 Batch C
+### 9.3 阶段 C
 
 - 左右二分、四象限、T 接、环带孔  
 - `assert_planar_map_valid`  
 - 栅格化往返  
 
-### 9.4 Batch D–E
+### 9.4 阶段 D–E
 
 - 圆 / 矩形 / 圆+遮挡圆  
 - `seam_p95` 相对基线下降  
@@ -681,20 +680,20 @@ Batch A ──► Batch B ──► Batch C ──► Batch D ──► Batch E
 - [x] 匹配主损失用共享边去重点 + Chamfer  
 - [x] `seam_p95` 进入日志与选优  
 - [x] 亚像素边 D1：`edge_subpixel` / `refine_edges_subpixel`  
-- [x] v3 预算环 + 特效章仍可跑通  
+- [x] 预算环 + 特效章仍可跑通  
 
 ### M4 — 质量冻结
 
 - [x] 相关单测 + 全量 pytest  
 - [x] ruff / pyright / pytest 全过  
-- [x] 本补篇状态改为「文档设计点已落地」并回写 v3 §11 对照表  
+- [x] 本补篇状态改为「文档设计点已落地」并回写主文档 §11 对照表  
 
 ---
 
 ## 12. 实施时的文档纪律
 
-1. 每完成一批，在本文件对应 Batch 节首标注状态：`未开工 | 进行中 | 已落地`  
-2. 行为变更同步改 v3 主文档 §3 / §4 / §11，避免两文档分叉  
+1. 每完成一批，在本文件对应阶段节首标注状态：`未开工 | 进行中 | 已落地`  
+2. 行为变更同步改 主文档 §3 / §4 / §11，避免两文档分叉  
 3. 配置项只增不静默改默认语义；若改默认须在修订表写明  
 4. 代码注解中文（见 `coding-conventions.md`）  
 
@@ -702,16 +701,45 @@ Batch A ──► Batch B ──► Batch C ──► Batch D ──► Batch E
 
 ## 13. 一句话
 
-> **Batch A/B 负责「像素属于谁」——无洞、少杂色、少软边；  
-> Batch C 负责「边界是一条还是两条」——共享边消灭拼合缝；  
-> Batch D/E 负责「边如何被图章解释」——高精度曲线与层栈一致。**
+> **阶段 A/B 负责「像素属于谁」——无洞、少杂色、少软边；  
+> 阶段 C 负责「边界是一条还是两条」——共享边消灭拼合缝；  
+> 阶段 D/E 负责「边如何被图章解释」——高精度曲线与层栈一致。**
 
 ---
 
-## 修订
+## 14. 色量 `num_colors`（平面化主旋钮）
 
-| 版本 | 日期 | 说明 |
-|------|------|------|
-| 0.3 | 2026-07-19 | 补齐 halfedge 环闭合校验、亚像素边 D1、匹配 `target_curve_pts` 按 edge_id 去重 |
-| 0.2 | 2026-07-19 | MVP 落地：自适应重采样、标签场无洞、PlanarMap、边上基元、seam_p95；pytest 覆盖 |
-| 0.1 | 2026-07-19 | 初稿：动机分层；Batch A–E 分点设计；模型；验收；里程碑；与 v3 映射 |
+> 状态：**已落地**（严格 LAB k-means；无 abstraction 插值、无近色软合并备用路径）
+
+### 14.1 语义
+
+| `num_colors` \(K\) | 含义 |
+|--------------------|------|
+| **2–4** | 极简 logo / 少色徽章 |
+| **6**（默认） | 一般徽章/插画 |
+| **8–16** | 更细色块（层数预算更紧） |
+
+- CLI：`bfemblem approx ... --num-colors 6`
+- 配置：`ApproxConfig.num_colors`
+- 代码：`label_field.estimate_palette_strict` + `build_label_field`；`planarize_image` 始终按 K 色量
+
+### 14.2 严格色量路径
+
+1. 主体像素 LAB k-means++，K = `num_colors`  
+2. 硬分配最近中心（无 lab_merge / hue_merge / 阴影吸收）  
+3. ICM 空间正则 + 过小连通域并邻域 + 主体无洞  
+4. compact 仅剔除空簇；调色板长度 ≤ K  
+
+### 14.3 与图章层的关系
+
+- 色数只控制平面化目标；图章层数由 `max_layers` 与区域匹配决定  
+- 同色多章并集覆盖仍可用，fill 锁为区域色  
+
+### 14.4 验收
+
+- 请求 `num_colors=K` 时 `len(palette) ≤ K`  
+- 硬边少色图：`len(palette)` 接近真实色数  
+- 主体内 `gap_frac=0`；现有标签场/共享边测试仍过  
+
+---
+

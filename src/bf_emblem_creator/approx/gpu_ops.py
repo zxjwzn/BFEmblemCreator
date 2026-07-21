@@ -232,15 +232,135 @@ def mask_to_sdf_fast(
     """GPU 快速近似 SDF（箱式模糊差分）。iters 越大距离场越平滑/更远。"""
     dev = device or as_device()
     m = to_torch(mask.astype(np.float32), device=dev) if not isinstance(mask, torch.Tensor) else mask.float().to(dev)
-    x = m[None, None]
+    batch = batch_mask_to_sdf(m[None, ...], device=dev, iters=iters)
+    return batch[0]
+
+
+def batch_alpha_to_masks(
+    alphas: torch.Tensor | NDArray[np.floating] | list[NDArray[np.floating]],
+    *,
+    thr: float = 96.0,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """
+    批量 alpha → bool mask。
+
+    alphas: (B,H,W) float/uint8，或 list[(H,W)]；返回 (B,H,W) bool（torch，在 device 上）。
+    thr：像素 alpha 阈值（默认 96，与图章曲线库一致）。
+    """
+    dev = device or as_device()
+    if isinstance(alphas, list):
+        stacked = np.stack([np.asarray(a, dtype=np.float32) for a in alphas], axis=0)
+        t = torch.from_numpy(np.ascontiguousarray(stacked)).to(dev)
+    elif isinstance(alphas, torch.Tensor):
+        t = alphas.float().to(dev)
+        if t.dim() == 2:
+            t = t[None, ...]
+    else:
+        arr = np.asarray(alphas, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+        t = torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
+    return t >= float(thr)
+
+
+def batch_mask_to_sdf(
+    masks: torch.Tensor | BoolArr | NDArray[np.floating],
+    *,
+    device: torch.device | None = None,
+    iters: int = 12,
+) -> FloatArr:
+    """
+    批量 GPU 近似 SDF。
+
+    masks: (B,H,W) 或 (H,W)；返回 float64 numpy (B,H,W)。
+    """
+    dev = device or as_device()
+    if isinstance(masks, torch.Tensor):
+        m = masks.float().to(dev)
+    else:
+        arr = np.asarray(masks)
+        arr = arr.astype(np.float32) if arr.dtype == np.bool_ or arr.dtype == np.uint8 else arr.astype(np.float32, copy=False)
+        m = torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
+    if m.dim() == 2:
+        m = m[None, ...]
+    # 统一到 0/1
+    m = (m > 0.5).float()
+    x = m[:, None, ...]
     n_iter = max(1, int(iters))
     for _ in range(n_iter):
         x = F.avg_pool2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
-    soft = x[0, 0]
-    # 尺度随迭代略增，保持数值量级可用
+    soft = x[:, 0]
     scale = 16.0 * (n_iter / 12.0) ** 0.5
     sdf = (0.5 - soft) * scale
     return sdf.detach().cpu().numpy().astype(np.float64)
+
+
+def largest_foreground_cc(
+    mask: BoolArr | torch.Tensor,
+    *,
+    device: torch.device | None = None,
+) -> BoolArr:
+    """前景最大四连通域；空则全 False。"""
+    ccs = label_connected_components(mask, device=device, max_labels=256)
+    if not ccs:
+        m = np.asarray(mask if not isinstance(mask, torch.Tensor) else mask.detach().cpu().numpy())
+        return np.zeros(m.shape[:2], dtype=bool)
+    return max(ccs, key=lambda c: int(c.sum()))
+
+
+def interior_hole_masks(
+    mask: BoolArr | torch.Tensor,
+    *,
+    device: torch.device | None = None,
+    min_area: float = 4.0,
+    max_holes: int = 32,
+) -> list[BoolArr]:
+    """
+    内洞 mask 列表：对背景 (~fg) 做连通域，剔除触图像边的分量。
+
+    返回按面积降序的 bool 数组列表（仅闭合内洞，不含外部背景）。
+    """
+    dev = device or as_device()
+    if isinstance(mask, torch.Tensor):
+        fg = mask.to(dev) > 0.5 if mask.dtype != torch.bool else mask.to(dev)
+        fg_np = fg.detach().cpu().numpy().astype(bool)
+    else:
+        fg_np = np.asarray(mask, dtype=bool)
+        fg = to_torch(fg_np.astype(np.float32), device=dev) > 0.5
+    if not bool(fg.any().item()):
+        return []
+    bg = ~fg
+    if not bool(bg.any().item()):
+        return []
+    # 背景连通域（GPU 标签传播）
+    bg_np = bg.detach().cpu().numpy().astype(bool)
+    ccs = label_connected_components(bg_np, device=dev, max_labels=max(64, max_holes * 4))
+    holes: list[tuple[int, BoolArr]] = []
+    for cc in ccs:
+        area = int(cc.sum())
+        if area < min_area:
+            continue
+        # 触边 → 外部背景，非内洞
+        if bool(cc[0, :].any()) or bool(cc[-1, :].any()) or bool(cc[:, 0].any()) or bool(cc[:, -1].any()):
+            continue
+        holes.append((area, cc.astype(bool)))
+    holes.sort(key=lambda t: -t[0])
+    return [m for _, m in holes[:max_holes]]
+
+
+def foreground_cc_masks(
+    mask: BoolArr | torch.Tensor,
+    *,
+    device: torch.device | None = None,
+    min_area: float = 4.0,
+    max_parts: int = 16,
+) -> list[BoolArr]:
+    """前景连通域，按面积降序（多部件图章）。"""
+    ccs = label_connected_components(mask, device=device, max_labels=max(32, max_parts * 2))
+    parts = [(int(c.sum()), c.astype(bool)) for c in ccs if int(c.sum()) >= min_area]
+    parts.sort(key=lambda t: -t[0])
+    return [m for _, m in parts[:max_parts]]
 
 
 def rgb_u8_to_lab_torch(

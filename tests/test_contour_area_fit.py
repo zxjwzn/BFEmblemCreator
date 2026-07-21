@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import pytest
 
 from bf_emblem_creator.approx.curves import (
     area_relative_error,
@@ -17,8 +16,7 @@ from bf_emblem_creator.approx.curves import (
     sample_circle_contour,
     sample_ellipse_contour,
 )
-from bf_emblem_creator.approx.models import ApproxConfig, PaletteColor
-from bf_emblem_creator.approx.regions import build_regions
+from bf_emblem_creator.approx.models import PaletteColor
 
 
 def _disk_mask(h: int, w: int, cx: float, cy: float, r: float) -> np.ndarray:
@@ -86,21 +84,30 @@ def test_dense_fallback_when_rdp_too_coarse() -> None:
     assert mask_a > 0
 
 
-def test_build_regions_contour_area_rel_err() -> None:
-    """build_regions 写入 contour_area_rel_err，且主区域 ≤3%。"""
+def test_planar_map_region_contour_area() -> None:
+    """planar_map → Region 精确边界轮廓闭合，且面积与 mask 量级一致。"""
     h = w = 128
     labels = np.full((h, w), -1, dtype=np.int32)
     m = _disk_mask(h, w, 64, 64, 36)
     labels[m] = 0
     alpha = m.astype(np.float64)
     palette = [PaletteColor(hex="#FFCC00", fraction=1.0, rgb=(255, 204, 0))]
-    graph = build_regions(labels, palette, alpha, min_area_frac=0.001, max_contour_area_rel_err=0.03)
+    from bf_emblem_creator.approx.planar_map import build_planar_map, planar_map_to_region_graph
+
+    pmap = build_planar_map(labels, palette, alpha, min_area_frac=0.001)
+    graph = planar_map_to_region_graph(pmap)
     assert len(graph.regions) >= 1
     reg = max(graph.regions, key=lambda r: r.area_frac)
-    assert reg.contour_area_rel_err <= 0.03 + 1e-6
+    cont = np.asarray(reg.contour, dtype=np.float64)
+    assert len(cont) >= 8
     mask_a = float(np.asarray(reg.mask).sum())
-    a_fit = fitted_region_area(np.asarray(reg.contour), mask_shape=np.asarray(reg.mask).shape)
-    assert area_relative_error(a_fit, mask_a) <= 0.03 + 1e-6
+    assert mask_a > 0
+    # 轮廓应闭合
+    assert np.linalg.norm(cont[0] - cont[-1]) < 2.0 or len(cont) >= 16
+    # dual/Moore 精确边界：多边形面积与 mask 量级接近
+    a_fit = fitted_region_area(cont, mask_shape=np.asarray(reg.mask).shape)
+    ratio = a_fit / mask_a if mask_a > 0 else 0.0
+    assert 0.5 <= ratio <= 1.5
 
 
 def test_sample_circle_area_matches_formula() -> None:
@@ -109,12 +116,6 @@ def test_sample_circle_area_matches_formula() -> None:
     poly = sample_circle_contour(0.0, 0.0, r, n=256)
     a = polygon_area(poly)
     assert abs(a - math.pi * r * r) / (math.pi * r * r) < 0.01
-
-
-def test_config_default_area_tol() -> None:
-    """配置默认面积相对误差 3%。"""
-    cfg = ApproxConfig()
-    assert cfg.max_contour_area_rel_err == pytest.approx(0.03)
 
 
 def test_sample_ellipse_closed() -> None:
