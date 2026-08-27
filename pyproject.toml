@@ -1,7 +1,7 @@
 [project]
 name = "bf-emblem-creator"
 version = "0.1.0"
-description = "战地图章徽章离线渲染器（后续扩展自动摆放）"
+description = "战地1 图章徽章离线渲染器（编辑器导出 JSON → PNG）"
 readme = "README.md"
 authors = [
     { name = "Zaxpris", email = "zaxpris@qq.com" }
@@ -12,7 +12,6 @@ dependencies = [
     "pillow>=10.0",
     "pydantic>=2.0",
     "pymupdf>=1.24",
-    "torch==2.11.0+cu128",
     "typer>=0.12",
 ]
 
@@ -30,14 +29,6 @@ dev = [
     "ruff>=0.9",
     "pyright>=1.1",
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }
 
 [tool.ruff]
 extend-exclude = []
