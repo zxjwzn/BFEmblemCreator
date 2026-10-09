@@ -1,6 +1,6 @@
 [project]
 name = "bf-emblem-creator"
-version = "0.1.0"
+version = "0.3.0"
 description = "战地1 图章徽章离线渲染器（编辑器导出 JSON → PNG）"
 readme = "README.md"
 authors = [
@@ -33,7 +33,7 @@ dev = [
 [tool.ruff]
 extend-exclude = []
 line-length = 128
-target-version = "py310"
+target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]

@@ -1,0 +1,2 @@
+# ruff format 要求 LF（见 pyproject.toml 的 line-ending），避免 autocrlf 检出为 CRLF
+*.py text eol=lf

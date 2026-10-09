@@ -1,7 +1,6 @@
 # BF Emblem Creator
 
-战地1 图章徽章工具：**编辑器导出 JSON 的离线渲染器**，以及**学习式徽章生成模型**的预研
-（见 `docs/research/`）。
+战地1 图章徽章工具：**编辑器导出 JSON 的离线渲染器**
 
 ## 规范
 
@@ -23,7 +22,10 @@ uv sync --all-groups
 - `left` / `top` → 图章**中心点**（可在画布外）
 - `width` / `height` → 可**远大于**画布（大章只露局部）
 - `angle` → 顺时针（度）
+- `flipX` / `flipY` → 水平 / 垂直镜像
+- `opacity` → 不透明度，0–1
 - `fill` → `#RRGGBB`
+- `selectable` → 编辑器 UI 字段；渲染忽略，导出时保留
 
 ## 命令行
 
@@ -54,11 +56,3 @@ uv run ruff format --check src tests
 uv run pyright
 uv run pytest
 ```
-
-## 文档
-
-分类索引见 [docs/README.md](docs/README.md)。
-
-- [徽章离线渲染器](docs/renderer/emblem-renderer.md) — 渲染器技术规格（JSON / 管线 / CLI）
-- [通用图章生成模型调研](docs/research/generative-model-survey.md) — 概念综述
-- [徽章生成模型设计（RL 闭环）](docs/research/emblem-rl-model.md) — **主攻方向**：自监督预训练 + 蒸馏 + GRPO
